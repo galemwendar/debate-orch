@@ -1,7 +1,7 @@
 """Протокол обсуждения: промпты для каждого этапа, схемы ответов и разбор JSON-вердиктов.
 
 Все договорённости с агентами живут здесь. Каждый ответ агента обязан заканчиваться блоком ```json с полем
-`verdict`; по нему движок (engine.py) решает, кому ход дальше. Первая строка каждого промпта — «Этап: <имя>»:
+`verdict`; по нему движок (engine.py) решает, кому ход дальше. Первая строка каждого промпта — «Stage: <имя>»:
 по ней легко найти нужный вызов в логах raw/ (и на неё же ориентируются тестовые агенты).
 """
 from __future__ import annotations
@@ -14,41 +14,61 @@ ROLE_RU = {"proposer": "Автор плана", "critic": "Критик", "execu
 # Уровни замечаний, которые блокируют согласие. minor не мешает консенсусу и передаётся исполнителю отдельным списком.
 BLOCKING = ("blocker", "major")
 
+# Заголовок раздела plan.md с открытыми minor-замечаниями. Его пишет engine.py, а p_exec/p_review на него ссылаются,
+# поэтому он задан в одном месте.
+OPEN_MINORS_HEADING = "Замечания критика, оставшиеся открытыми"
+
+# ---------------------------------------------------------------------------------------------------------------
+# Язык
+# ---------------------------------------------------------------------------------------------------------------
+# Промпты написаны по-английски: модели точнее держат английские инструкции (особенно формат JSON), а латиница
+# занимает заметно меньше токенов, чем кириллица, — экономия на каждом ходе. На каком языке агенты пишут текст
+# (планы, замечания, вопросы), задаёт настройка `[rules] language`.
+LANGUAGES = {"ru": "Russian", "en": "English", "uk": "Ukrainian", "de": "German", "fr": "French", "es": "Spanish",
+             "it": "Italian", "pt": "Portuguese", "pl": "Polish", "zh": "Chinese", "ja": "Japanese", "ko": "Korean"}
+
+
+def language_name(code: str) -> str:
+    """Код языка (`ru`) → название для промпта (`Russian`); неизвестное значение передаётся как есть."""
+    code = (code or "ru").strip()
+    return LANGUAGES.get(code.lower(), code)
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # Системные правила (добавляются к системному промпту CLI или, если CLI так не умеет, — в первое сообщение)
 # ---------------------------------------------------------------------------------------------------------------
 
 COMMON_RULES = """\
-Ты участник структурированного обсуждения двух ИИ-агентов. \
-Обсуждением управляет программа-оркестратор: она передаёт твои ответы второму агенту и зовёт пользователя, когда нужно.
-Правила:
-- Пиши по-русски.
-- Опирайся на факты из репозитория: файлы, строки, конфиги, результаты лёгких проверок. Ссылайся на них (путь:строка).
-- Не соглашайся из вежливости. Согласие означает: ты сам проверил и существенных проблем не нашёл.
-- Не повторяй уже закрытые пункты и не пересказывай собеседника.
-- Комментарии пользователя обязательны к исполнению.
-- Вопрос пользователю (questions_for_user) задавай, только если без ответа нельзя продолжать или решение критично: \
-удаление/перезапись данных, тяжёлые или долгие прогоны, изменение цели или объёма работ, доступ к проду, деньги.
-- Shell-команды на этапе обсуждения ограничены списком только для чтения (ls, cat, head, tail, wc, grep, rg, git status/log/diff/show, pdfinfo, pdffonts, file, stat и т. п.; файлы ищи инструментами поиска, а не find). Не начинай команду с `cd …;` и не склеивай команды через `;` или `&&` — пиши отдельные команды с абсолютными путями, иначе их отклонят. Если для проверки нужна команда вне списка (сеть, ssh, запуск скриптов), просто выполни её: оркестратор покажет её пользователю и спросит разрешение.
-- КАЖДЫЙ ответ заканчивай ровно одним блоком ```json по схеме из запроса. Текст до блока допустим, но краткий."""
+You are one of two AI agents in a structured discussion. \
+An orchestrator program runs the discussion: it passes your replies to the other agent and calls in the user when needed.
+Rules:
+- Write all prose (summaries, plans, points, questions) in {language}. Keep JSON keys and enum values exactly as in the schema.
+- Ground every claim in facts from the repository: files, lines, configs, results of lightweight checks. Cite them (path:line).
+- Do not agree out of politeness. Agreeing means you checked yourself and found no significant problems.
+- Do not reopen points that are already closed, and do not restate the other agent.
+- User comments are mandatory.
+- Ask the user (questions_for_user) only if you cannot proceed without an answer or the decision is critical: \
+deleting or overwriting data, heavy or long-running jobs, changing the goal or scope, production access, money.
+- During the discussion, shell commands are limited to a read-only list (ls, cat, head, tail, wc, grep, rg, git status/log/diff/show, pdfinfo, pdffonts, file, stat, etc.; use your file-search tools instead of find). Do not start a command with `cd …;` and do not chain commands with `;` or `&&` — run separate commands with absolute paths, otherwise they are rejected. If a check needs a command outside the list (network, ssh, running scripts), just run it: the orchestrator will show it to the user and ask for permission.
+- End EVERY reply with exactly one ```json block following the schema in the request. Text before the block is allowed but keep it short."""
 
 ROLE_RULES = {
-    "proposer": "Твоя роль: автор плана. Ты предлагаешь решение и дорабатываешь его по критике. "
-                "На этапе обсуждения ничего не меняй в файлах и не запускай тяжёлого.",
-    "critic": "Твоя роль: независимый критик. Ищи ошибки, пропуски, неверные допущения и риски; проверяй по коду и данным, "
-              "а не по словам автора. На этапе обсуждения ничего не меняй в файлах и не запускай тяжёлого.",
-    "executor": "Твоя роль: исполнитель. Реализуешь согласованный план точно и без самодеятельности. "
-                "Не коммить: изменения оставь в рабочей копии.",
-    "reviewer": "Твоя роль: ревьюер. Проверяешь изменения исполнителя на соответствие плану, корректность и риски. "
-                "Ничего не меняй в файлах.",
+    "proposer": "Your role: plan author. You propose a solution and refine it based on the critique. "
+                "During the discussion, do not modify files and do not run anything heavy.",
+    "critic": "Your role: independent critic. Look for errors, gaps, wrong assumptions and risks; verify against the code "
+              "and data, not the author's words. During the discussion, do not modify files and do not run anything heavy.",
+    "executor": "Your role: executor. Implement the agreed plan precisely, without improvising. "
+                "Do not commit: leave the changes in the working tree.",
+    "reviewer": "Your role: reviewer. Check the executor's changes for conformance to the plan, correctness and risks. "
+                "Do not modify files.",
 }
 
 
-def system_rules(role: str, extra: str = "") -> str:
-    """Правила для роли + дополнительные правила проекта из `[rules] extra`."""
-    s = COMMON_RULES + "\n\n" + ROLE_RULES[role]
+def system_rules(role: str, extra: str = "", language: str = "ru") -> str:
+    """Правила для роли + язык ответов + дополнительные правила проекта из `[rules] extra`."""
+    s = COMMON_RULES.format(language=language_name(language)) + "\n\n" + ROLE_RULES[role]
     if extra.strip():
-        s += "\n\nДополнительные правила проекта:\n" + extra.strip()
+        s += "\n\nAdditional project rules:\n" + extra.strip()
     return s
 
 
@@ -59,84 +79,85 @@ Q_FIELD = '"questions_for_user": [{"question": "...", "why_critical": "..."}]'
 
 SCHEMA_PROPOSAL = f"""```json
 {{"verdict": "proposal | need_user",
- "summary": "2-4 предложения: суть плана",
- "plan": "ПОЛНЫЙ план в markdown: цель, шаги, затрагиваемые файлы, критерии приёмки, риски",
+ "summary": "2-4 sentences: the essence of the plan",
+ "plan": "the FULL plan in markdown: goal, steps, affected files, acceptance criteria, risks",
  {Q_FIELD}}}
 ```"""
 
 SCHEMA_ANALYSIS = f"""```json
 {{"verdict": "analysis | need_user",
- "summary": "2-4 предложения",
- "key_points": ["что важно, где риски, как бы ты решал"],
+ "summary": "2-4 sentences",
+ "key_points": ["what matters, where the risks are, how you would solve it"],
  {Q_FIELD}}}
 ```"""
 
 SCHEMA_CRITIQUE = f"""```json
 {{"verdict": "agree | disagree | need_user",
- "summary": "2-4 предложения",
- "points": [{{"id": "C1", "severity": "blocker | major | minor", "claim": "в чём проблема",
-             "evidence": "путь:строка или результат проверки", "suggestion": "как исправить"}}],
+ "summary": "2-4 sentences",
+ "points": [{{"id": "C1", "severity": "blocker | major | minor", "claim": "what the problem is",
+             "evidence": "path:line or check result", "suggestion": "how to fix it"}}],
  {Q_FIELD}}}
 ```
-agree — существенных проблем нет (допустимы только minor). disagree — есть хотя бы один blocker или major.
-Нумерацию пунктов продолжай между раундами (C1, C2, …); пункт, который остаётся открытым, сохраняет свой id."""
+agree — no significant problems (only minor points allowed). disagree — at least one blocker or major.
+Continue point numbering across rounds (C1, C2, …); a point that stays open keeps its id."""
 
 SCHEMA_RESPONSE = f"""```json
 {{"verdict": "revised | hold | need_user",
- "summary": "что изменил и почему",
- "plan": "ПОЛНАЯ актуальная версия плана в markdown",
- "responses": [{{"id": "C1", "decision": "accepted | rejected", "why": "обоснование, для rejected — с доказательствами"}}],
+ "summary": "what you changed and why",
+ "plan": "the FULL current version of the plan in markdown",
+ "responses": [{{"id": "C1", "decision": "accepted | rejected", "why": "reasoning; for rejected — with evidence"}}],
  {Q_FIELD}}}
 ```
-revised — план изменён; hold — план не изменён, все пункты отклонены с обоснованием."""
+revised — the plan was changed; hold — the plan is unchanged, every point rejected with reasoning."""
 
 SCHEMA_EXEC = f"""```json
 {{"verdict": "done | blocked | need_user",
- "summary": "что сделано",
+ "summary": "what was done",
  "changed_files": ["..."],
- "checks_run": ["какие проверки запускал и результат"],
+ "checks_run": ["which checks you ran and their results"],
  {Q_FIELD}}}
 ```"""
 
 SCHEMA_REVIEW = f"""```json
 {{"verdict": "approve | changes_requested | need_user",
- "summary": "2-4 предложения",
- "points": [{{"id": "R1", "severity": "blocker | major | minor", "claim": "...", "evidence": "путь:строка", "suggestion": "..."}}],
+ "summary": "2-4 sentences",
+ "points": [{{"id": "R1", "severity": "blocker | major | minor", "claim": "...", "evidence": "path:line", "suggestion": "..."}}],
  {Q_FIELD}}}
 ```"""
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# Промпты этапов
+# Промпты этапов. Первая строка каждого — «Stage: <имя>».
 # ---------------------------------------------------------------------------------------------------------------
 def p_blind(brief: str) -> str:
     """Критик разбирает задачу сам, ещё не видя плана: потом ему есть с чем сравнить, и он реже поддакивает."""
-    return f"""Этап: independent_analysis
+    return f"""Stage: independent_analysis
 
-Задача от пользователя:
+Task from the user:
 <task>
 {brief}
 </task>
 
-Второй агент сейчас готовит план. Не дожидаясь его, сделай собственный независимый разбор: изучи репозиторий, \
-что здесь важно, где риски, как бы ты решал. Это твоя опорная позиция: позже ты сравнишь с ней план автора.
+The other agent is preparing a plan right now. Without waiting for it, do your own independent analysis: study the \
+repository, what matters here, where the risks are, how you would solve it. This is your baseline: later you will \
+compare the author's plan against it.
 
-Схема ответа:
+Response schema:
 {SCHEMA_ANALYSIS}"""
 
 
 def p_propose(brief: str) -> str:
     """Автор готовит первую версию плана."""
-    return f"""Этап: propose
+    return f"""Stage: propose
 
-Задача от пользователя:
+Task from the user:
 <task>
 {brief}
 </task>
 
-Изучи репозиторий и предложи план решения. План будет проверять независимый критик.
+Study the repository and propose a plan. An independent critic will review it.
 
-Схема ответа:
+Response schema:
 {SCHEMA_PROPOSAL}"""
 
 
@@ -144,63 +165,64 @@ def p_critique(author: str, version: int, plan: str, responses: list | None) -> 
     """Критик проверяет текущую версию плана; видит ответы автора на свои прошлые пункты."""
     resp = ""
     if responses:
-        resp = "\n\nОтветы автора на твои прошлые пункты:\n" + fmt_responses(responses)
-    return f"""Этап: critique
+        resp = "\n\nThe author's responses to your previous points:\n" + fmt_responses(responses)
+    return f"""Stage: critique
 
-Автор ({author}) предлагает план, версия {version}:
+The author ({author}) proposes a plan, version {version}:
 <plan>
 {plan}
 </plan>{resp}
 
-Проверь план по коду и данным и сравни со своим независимым разбором. Если автор обоснованно закрыл пункт — не поднимай его снова.
+Verify the plan against the code and data and compare it with your independent analysis. If the author closed a point \
+with good reason, do not raise it again.
 
-Схема ответа:
+Response schema:
 {SCHEMA_CRITIQUE}"""
 
 
 def p_respond(critic: str, crit: dict) -> str:
     """Автор отвечает на каждый существенный пункт: принять и исправить или отклонить с доказательствами."""
-    return f"""Этап: respond
+    return f"""Stage: respond
 
-Критик ({critic}) ответил:
+The critic ({critic}) replied:
 {crit.get("summary", "")}
 
-Пункты:
+Points:
 {fmt_points(crit.get("points", []))}
 
-По каждому пункту blocker/major: прими (и исправь план) или аргументированно отклони с доказательствами. \
-minor — на твоё усмотрение. Верни полную актуальную версию плана.
+For each blocker/major point: accept it (and fix the plan) or reject it with evidence. \
+minor — at your discretion. Return the full current version of the plan.
 
-Схема ответа:
+Response schema:
 {SCHEMA_RESPONSE}"""
 
 
 def p_revise_with_note() -> str:
     """Доработка плана по комментарию пользователя (сам комментарий идёт выше, блоком notes_block)."""
-    return f"""Этап: respond
+    return f"""Stage: respond
 
-Пользователь прислал комментарий к плану (см. выше). Доработай план с его учётом и верни полную актуальную версию.
+The user sent a comment on the plan (see above). Revise the plan accordingly and return the full current version.
 
-Схема ответа:
+Response schema:
 {SCHEMA_RESPONSE}"""
 
 
 def p_continue() -> str:
     """Продолжение после ответа пользователя на вопросы агента."""
-    return """Этап: continue
+    return """Stage: continue
 
-Пользователь ответил на вопросы (см. выше). Продолжи с учётом ответа и верни ответ по той же схеме, что в прошлый раз."""
+The user answered the questions (see above). Continue taking the answer into account and reply using the same schema as last time."""
 
 
 def p_after_grant(patterns: list[str]) -> str:
     """Повтор хода после того, как пользователь выдал разрешения на отклонённые команды."""
     plist = "\n".join(f"- {x}" for x in patterns)
-    return f"""Этап: continue_after_grant
+    return f"""Stage: continue_after_grant
 
-Пользователь разрешил в этом обсуждении команды по шаблонам:
+The user allowed commands matching these patterns for this discussion:
 {plist}
-Выполни проверки, которые не удались из-за запрета, и дай обновлённый ПОЛНЫЙ ответ по той же схеме, что требовалась
-в задании этого хода (не ссылайся на прошлый ответ — оркестратор возьмёт только новый JSON-блок)."""
+Run the checks that failed because they were denied, and give an updated FULL reply using the schema required by this
+turn's task (do not refer to your previous reply — the orchestrator only takes the new JSON block)."""
 
 
 # Команды, у которых осмысленный шаблон разрешения — по двум словам (`git status`, `docker compose`), а не по одному:
@@ -255,75 +277,76 @@ def suggest_patterns(denials: list[dict]) -> list[str]:
 
 def p_resume_cancelled(reason: str) -> str:
     """Продолжение хода, который CLI оборвал из-за запрещённого действия (так делает Grok в headless-режиме)."""
-    return f"""Этап: continue_after_denial
+    return f"""Stage: continue_after_denial
 
-Твой прошлый ход оборвался, не дойдя до ответа: {reason}
-Это действие на текущем этапе запрещено. Продолжи работу без него: команды из разрешённого списка только для чтения
-и инструменты чтения файлов доступны, а то, что можно проверить только запрещённым действием, отметь в ответе как
-непроверенное («нужно проверить: …»). Затем дай полный ответ по той же схеме, что требовалась в задании этого хода."""
+Your previous turn stopped before producing a reply: {reason}
+That action is not allowed at this stage. Continue without it: the read-only commands from the allowed list and your
+file-reading tools are still available; anything that can only be verified with the denied action, mark in your reply
+as unverified ("needs checking: …"). Then give a full reply using the schema required by this turn's task."""
 
 
 # Если в ответе не нашлось разбираемого JSON-блока, агента один раз просят повторить только блок.
-FIX_JSON = """Этап: fix_json
+FIX_JSON = """Stage: fix_json
 
-Оркестратор не смог разобрать JSON-блок в твоём прошлом ответе. Повтори ответ ТОЛЬКО одним корректным блоком ```json по той же схеме, без текста вокруг."""
+The orchestrator could not parse the JSON block in your previous reply. Repeat the reply as ONLY one valid ```json block using the same schema, with no text around it."""
 
 
 def p_exec(plan: str, workdir: str) -> str:
     """Исполнитель реализует итоговый plan.md в рабочем каталоге (обычно — отдельный git worktree)."""
-    return f"""Этап: execute
+    return f"""Stage: execute
 
-Реализуй согласованный план. Рабочий каталог: {workdir}. Работай только в нём.
-Тяжёлые и долгие прогоны запускай, только если план прямо это требует. Не коммить.
-Если в плане есть раздел «Замечания критика, оставшиеся открытыми» — по каждому замечанию либо учти его,
-либо объясни в summary, почему не стал (например, выходит за рамки плана).
+Implement the agreed plan. Working directory: {workdir}. Work only inside it.
+Run heavy or long jobs only if the plan explicitly requires it. Do not commit.
+If the plan has a section "{OPEN_MINORS_HEADING}" (the critic's remaining open points), either address each point
+or explain in summary why you did not (for example, it is out of the plan's scope).
 
 <plan>
 {plan}
 </plan>
 
-Схема ответа:
+Response schema:
 {SCHEMA_EXEC}"""
 
 
 def p_review(plan: str, exec_summary: str, stat: str, diff: str, truncated: bool) -> str:
     """Ревьюер получает план, отчёт исполнителя и дифф (длинный дифф обрезается, файлы доступны в каталоге)."""
-    note = "\n(дифф обрезан — остальное смотри в файлах рабочего каталога)" if truncated else ""
-    return f"""Этап: review
+    note = "\n(diff truncated — see the files in the working directory for the rest)" if truncated else ""
+    return f"""Stage: review
 
-Исполнитель реализовал план. Проверь изменения: соответствие плану, ошибки, риски, недостающее.
-Открытые замечания критика из плана исполнитель должен был учесть или объяснить отказ в отчёте — проверь и это.
+The executor has implemented the plan. Review the changes: conformance to the plan, bugs, risks, anything missing.
+The executor had to address the critic's open points from the plan (section "{OPEN_MINORS_HEADING}") or explain
+in the report why not — check that too.
 
 <plan>
 {plan}
 </plan>
 
-Отчёт исполнителя: {exec_summary}
+Executor's report: {exec_summary}
 
-Изменённые файлы:
+Changed files:
 {stat}
 
-Дифф:{note}
+Diff:{note}
 ```diff
 {diff}
 ```
 
-Схема ответа:
+Response schema:
 {SCHEMA_REVIEW}"""
 
 
 def p_fix(review: dict) -> str:
     """Исполнитель правит код по замечаниям ревьюера."""
-    return f"""Этап: fix
+    return f"""Stage: fix
 
-Ревьюер запросил изменения:
+The reviewer requested changes:
 {review.get("summary", "")}
 
 {fmt_points(review.get("points", []))}
 
-Исправь blocker/major (minor — по усмотрению). Если с пунктом не согласен — объясни в summary.
+Fix blocker/major points (minor — at your discretion). If you disagree with a point, explain in summary.
 
-Схема ответа:
+Response schema:
 {SCHEMA_EXEC}"""
 
 
@@ -331,7 +354,7 @@ def notes_block(notes: list[str]) -> str:
     """Комментарии пользователя, ещё не доставленные агенту, — ставятся перед промптом его следующего хода."""
     if not notes:
         return ""
-    return "Комментарии и решения пользователя (обязательны к учёту):\n" + "\n".join(f"- {n}" for n in notes) + "\n\n"
+    return "User comments and decisions (mandatory):\n" + "\n".join(f"- {n}" for n in notes) + "\n\n"
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -376,19 +399,19 @@ def minor_points(data: dict) -> list[dict]:
 # ---------- форматирование для промптов и transcript.md ----------
 def fmt_points(points: list) -> str:
     if not points:
-        return "(нет)"
+        return "(none)"
     lines = []
     for p in points:
         lines.append(f"- [{p.get('id', '?')}] ({p.get('severity', '?')}) {p.get('claim', '')}")
         if p.get("evidence"):
-            lines.append(f"  доказательство: {p['evidence']}")
+            lines.append(f"  evidence: {p['evidence']}")
         if p.get("suggestion"):
-            lines.append(f"  предложение: {p['suggestion']}")
+            lines.append(f"  suggestion: {p['suggestion']}")
     return "\n".join(lines)
 
 
 def fmt_responses(responses: list) -> str:
-    return "\n".join(f"- [{r.get('id', '?')}] {r.get('decision', '?')}: {r.get('why', '')}" for r in responses) or "(нет)"
+    return "\n".join(f"- [{r.get('id', '?')}] {r.get('decision', '?')}: {r.get('why', '')}" for r in responses) or "(none)"
 
 
 def fmt_questions(qs: list) -> str:
@@ -397,7 +420,7 @@ def fmt_questions(qs: list) -> str:
         if isinstance(q, str):
             out.append(f"{i}. {q}")
         else:
-            out.append(f"{i}. {q.get('question', '')}" + (f"\n   почему важно: {q['why_critical']}" if q.get("why_critical") else ""))
+            out.append(f"{i}. {q.get('question', '')}" + (f"\n   why it matters: {q['why_critical']}" if q.get("why_critical") else ""))
     return "\n".join(out)
 
 

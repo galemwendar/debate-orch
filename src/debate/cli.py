@@ -409,7 +409,7 @@ def cmd_probe(args) -> int:
         return 2
     tmp = Path(tempfile.mkdtemp(prefix="debate-probe-"))
     subprocess.run(["git", "init", "-q"], cwd=tmp)
-    probe_readme = "# Тестовый проект\n\nСлужебный каталог для проверки CLI. Номер стенда: 4817.\n"
+    probe_readme = "# Test project\n\nScratch directory for checking the CLI. Test bench number: 4817.\n"
     ok_all = True
     for name in names:
         a = cfg["agents"][name]
@@ -420,26 +420,27 @@ def cmd_probe(args) -> int:
             continue
         agent = Agent.from_cfg(name, "critic", a, 600, None)
         (tmp / "README.md").write_text(probe_readme, encoding="utf-8")
-        rules = P.system_rules("critic")
+        rules = P.system_rules("critic", language=cfg["rules"].get("language", "ru"))
         try:
             # обычная рабочая задача: прочитать файл и ответить JSON-блоком (без «повтори дословно» —
             # такие просьбы модели принимают за попытку обойти правила и отказываются)
-            r1 = agent.ask('Прочитай README.md в текущем каталоге и кратко перескажи его. Ответ закончи блоком по схеме:\n'
-                           '```json\n{"verdict": "agree", "summary": "пересказ README"}\n```', cwd=tmp, rules=rules)
+            r1 = agent.ask('Read README.md in the current directory and briefly summarize it. End your reply with a block '
+                           'following this schema:\n```json\n{"verdict": "agree", "summary": "README summary"}\n```',
+                           cwd=tmp, rules=rules)
             console.print(Panel(r1.raw[:2500] or "(пусто)", title="сырой вывод (1)", border_style="dim"))
             d = P.extract_json(r1.text)
             console.print(f"текст разобран: {'[green]да[/]' if r1.text and r1.text != r1.raw else '[yellow]как есть[/]'} · "
                           f"JSON-вердикт: {'[green]да[/]' if d else '[red]нет[/]'} · session_id: {r1.session_id or '—'} · "
                           f"токены: {r1.tokens_in}/{r1.tokens_out}")
             (tmp / "README.md").unlink(missing_ok=True)  # файла больше нет: ответить можно только из памяти сессии
-            r2 = agent.ask("Какой номер стенда был указан в README.md, который ты читал в прошлом ходе? "
-                           "Файл уже удалён, ответь по памяти одним числом.", cwd=tmp, rules=rules)
+            r2 = agent.ask("What test bench number was in the README.md you read in your previous turn? "
+                           "The file has been deleted, answer from memory with a single number.", cwd=tmp, rules=rules)
             remembers = "4817" in r2.text
             console.print(f"сессия продолжается: {'[green]да[/]' if remembers else '[red]нет[/]'} → {r2.text.strip()[:200]!r}")
             ok_all &= bool(d) and remembers
             # выданное разрешение (Bash(echo:*)) действительно пропускает команду
             agent.grants = ["Bash(echo:*)"]
-            r3 = agent.ask("Проверка окружения: выполни shell-команду echo probe-ok-42 и сообщи, что она вывела.",
+            r3 = agent.ask("Environment check: run the shell command echo probe-ok-42 and report what it printed.",
                            cwd=tmp, rules="")
             agent.grants = []
             ran = "probe-ok-42" in r3.text and not r3.denials and r3.stop != "cancelled"
@@ -447,7 +448,7 @@ def cmd_probe(args) -> int:
                           f" · stop={r3.stop or '—'} · отказы: {[x['cmd'] for x in r3.denials] or '—'}")
             ok_all &= ran
             if not args.no_write_check:
-                agent.ask("Создай в текущем каталоге файл probe_write.txt с текстом hello. Это проверка прав.",
+                agent.ask("Create a file probe_write.txt with the text hello in the current directory. This is a permissions check.",
                           cwd=tmp, rules="")
                 wrote = (tmp / "probe_write.txt").exists()
                 console.print(f"режим обсуждения только для чтения: "

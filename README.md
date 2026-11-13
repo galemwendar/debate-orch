@@ -5,7 +5,8 @@
 > *English summary:* a console orchestrator that makes two coding-agent CLIs (Claude Code, Grok Build, Qwen Code,
 > OpenCode) argue about an implementation plan until they agree, escalating to you only on deadlock or critical
 > questions, then executes the agreed plan in a git worktree with a cross-review loop. It drives the official CLIs
-> headless, so it runs on your existing subscriptions — no API keys. The UI and agent prompts are in Russian.
+> headless, so it runs on your existing subscriptions — no API keys. Agent prompts are in English, agents reply in the
+> language you set (`[rules] language`, Russian by default); the console UI is in Russian for now.
 
 Вы даёте задачу или тикет. Автор (по умолчанию Claude Code) пишет план, критик (по умолчанию Grok Build) его разбирает,
 они спорят сами, по раундам. Вас зовут, только когда:
@@ -161,6 +162,9 @@ allow_exec = ["Bash(dotnet build:*)", "Bash(dotnet test:*)"]
 extra = "Тесты запускать через dotnet test, миграции БД не трогать."
 ```
 
+Язык, на котором агенты пишут планы, замечания и вопросы, — `[rules] language` (по умолчанию `ru`; можно `en`, `de`…
+или название языка). Сами инструкции агентам всегда на английском.
+
 `debate config` показывает итоговые настройки и файл, из которого взято каждое значение (`--all` — все агенты,
 а не только назначенные). Пример со всеми ключами — [`debate.example.toml`](debate.example.toml).
 Файл `debate.toml` в корне репозитория тоже читается (между общим конфигом и `.debate/config.toml`) — для совместимости.
@@ -248,7 +252,8 @@ debate models opencode     # список моделей, если CLI это у
 - Worktree строится от последнего коммита: в нём нет незакоммиченных правок и файлов вне git (данных, `.env`, моделей).
   Для таких задач — `--in-place` или абсолютные пути в плане.
 - Корнем репозитория считается текущий каталог (или `--repo`), а не ближайший каталог с `.git`.
-- Интерфейс и промпты агентов — на русском.
+- Интерфейс пока только на русском. Промпты агентам — на английском (модели точнее держат английские инструкции,
+  и это дешевле по токенам), а язык, на котором агенты пишут планы и замечания, задаётся `[rules] language`.
 - Форматы вывода CLI не везде задокументированы и могут меняться между версиями — для этого и есть `debate probe`.
 
 Что планируется — в [PLAN.md](PLAN.md).

@@ -252,12 +252,12 @@ class Engine:
         if ch == "s":
             raise Stopped
         if ch == "p":
-            self._broadcast("Пользователь принял текущий план автора, несмотря на возражения критика.", ("proposer", "critic"))
+            self._broadcast("The user accepted the author's current plan despite the critic's objections.", ("proposer", "critic"))
             self.minors = P.blocking_points(crit) + P.minor_points(crit)
             return "accept"
         if ch == "c":
             ids = ", ".join(str(p.get("id")) for p in P.blocking_points(crit))
-            self._broadcast(f"Пользователь поддерживает критика по пунктам {ids}. Автор должен исправить план.",
+            self._broadcast(f"The user sides with the critic on points {ids}. The author must fix the plan.",
                             ("proposer", "critic"))
         else:
             note = self.ui.text("Ваше решение")
@@ -378,7 +378,7 @@ class Engine:
         agent = self.roles[role]
         label = f"{P.ROLE_RU[role]} · {agent.name}"
         full = P.notes_block(self.notes[role]) + prompt
-        rules = P.system_rules(role, self.cfg["rules"].get("extra", ""))
+        rules = P.system_rules(role, self.cfg["rules"].get("extra", ""), self.cfg["rules"].get("language", "ru"))
         while True:
             try:
                 with self.ui.working(label):
@@ -512,8 +512,8 @@ class Engine:
                 qs = [data.get("summary", "Агенту нужно ваше решение.")]
             label = f"{P.ROLE_RU[role]} · {self.roles[role].name}"
             ans = self.ui.text(f"{label} спрашивает:\n{P.fmt_questions(qs)}\n\nВаш ответ (пусто — «решайте сами»)")
-            ans = ans or "Пользователь не ответил: решайте сами, выберите самый безопасный вариант."
-            self._broadcast(f"Вопросы ({label}): {P.fmt_questions(qs)}\nОтвет пользователя: {ans}",
+            ans = ans or "The user did not answer: decide yourselves and choose the safest option."
+            self._broadcast(f"Questions from {role} ({self.roles[role].name}):\n{P.fmt_questions(qs)}\nUser's answer: {ans}",
                             ("proposer", "critic") if role in ("proposer", "critic") else ("executor", "reviewer"))
             if not need:
                 return data
@@ -549,7 +549,7 @@ class Engine:
                   else "принят пользователем при открытых возражениях")
         s = f"# План (v{self.version})\n\nСтатус: {status}.\n\n{self.plan}\n"
         if self.minors:
-            s += "\n## Замечания критика, оставшиеся открытыми\n\n" + P.fmt_points(self.minors) + "\n"
+            s += f"\n## {P.OPEN_MINORS_HEADING}\n\n" + P.fmt_points(self.minors) + "\n"
         return s
 
     def _write_plan(self, outcome: str) -> None:

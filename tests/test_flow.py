@@ -373,7 +373,25 @@ def test_legacy_state_resume():
         assert e.f["phase"] == "done"
 
 
+def test_language_setting():
+    """Промпты на английском, язык ответов агентов задаётся [rules] language и доходит до системных правил."""
+    from debate import protocol as P
+    assert "in Russian" in P.system_rules("critic")
+    assert "in English" in P.system_rules("critic", language="en")
+    assert "in Klingon" in P.system_rules("critic", language="Klingon")
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo, cfg = setup(tmp)
+        cfg = deep_merge(cfg, {"rules": {"language": "en"}, "exec": {"enabled": False}})
+        ui = ScriptUI(choices=["q"], texts=[])
+        e = Engine(cfg, repo, ui, brief="Task")
+        e.run()
+        first = sorted((e.dir / "raw").glob("critic-*.prompt.md"))[0].read_text()
+        assert "Stage: independent_analysis" in first and "in English" in first
+
+
 if __name__ == "__main__":
+    test_language_setting()
     test_agent_gets_pwd_of_workdir()
     test_layered_config()
     test_resume_with_role_switch()

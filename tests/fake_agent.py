@@ -49,7 +49,7 @@ def shell_allowed(cmd: str) -> bool:
     if kind == "qwen":
         return f"run_shell_command({cmd})" in argv
     return f"Bash({cmd}:*)" in argv
-stage = (re.search(r"Этап: (\w+)", prompt) or [None, "probe"])[1]
+stage = (re.search(r"Stage: (\w+)", prompt) or [None, "probe"])[1]
 counter_file = state / f"{kind}-{stage}.n"
 n = int(counter_file.read_text()) + 1 if counter_file.exists() else 1
 counter_file.write_text(str(n))
@@ -108,7 +108,7 @@ elif stage == "continue":
     text = j({"verdict": "agree", "summary": "Учёл ответ", "points": []})
 else:  # probe
     mem = state / f"{kind}-{sid}.mem"
-    if "по памяти" in prompt:
+    if "from memory" in prompt:
         text = mem.read_text() if mem.exists() else "не помню"
     elif "probe-ok-42" in prompt:
         text = "probe-ok-42" if shell_allowed("echo") else "нет разрешения"
