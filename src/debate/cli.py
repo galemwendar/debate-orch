@@ -29,7 +29,7 @@ from rich.table import Table
 
 from . import protocol as P
 from .agents import KINDS, Agent, AgentError, TurnResult, models_command
-from .config import load_config
+from .config import GLOBAL_CONFIG, load_config, role_agents, role_chain, roles_toml, suggest_roles, write_roles
 from .engine import Engine, _n, list_debates
 
 # цвета рамок по виду агента (по имени агента из [agents])
@@ -176,7 +176,7 @@ def apply_overrides(cfg: dict, roles: list[str], models: list[str]) -> None:
             raise ValueError(f"--role {item}: нужно роль=агент, роли: {', '.join(cfg['roles'])}")
         if v not in cfg["agents"]:
             raise ValueError(f"--role {item}: агент {v!r} не описан, есть: {', '.join(cfg['agents'])}")
-        cfg["roles"][k] = v
+        cfg["roles"][k] = v  # явное назначение на запуск: без запасных
     for item in models:
         k, _, v = item.partition("=")
         if k not in cfg["agents"] or not v:
@@ -224,20 +224,37 @@ def cmd_run(args) -> int:
         cfg["debate"]["max_rounds"] = args.rounds
     if args.no_exec:
         cfg["exec"]["enabled"] = False
-    if args.in_place:
+    if getattr(args, "in_place", False):
         cfg["exec"]["use_worktree"] = False
-    for name, a in cfg["agents"].items():
-        if name in cfg["roles"].values() and not shutil.which(a["cmd"]):
-            console.print(f"[red]Не найден в PATH:[/red] {a['cmd']} (агент {name})")
+    if getattr(args, "worktree", False):
+        cfg["exec"]["use_worktree"] = True
+    for role in cfg["roles"]:
+        chain = role_chain(cfg, role)
+        for name in chain:
+            if name not in cfg["agents"]:
+                console.print(f"[red]Роль {role}: агент {name!r} не описан в \\[agents][/red]")
+                return 2
+        found = [n for n in chain if shutil.which(cfg["agents"][n]["cmd"])]
+        if not found:
+            console.print(f"[red]Роль {role}: ни один агент не найден в PATH:[/red] {', '.join(chain)}")
             return 2
+        if found[0] != chain[0]:
+            console.print(f"[yellow]Роль {role}: {chain[0]} не найден в PATH — роль берёт {found[0]}[/yellow]")
+            cfg["roles"][role] = found if len(chain) > 1 else found[0]
     brief = read_ticket(args, console)
     if not brief.strip():
         console.print("[red]Пустая задача.[/red]")
         return 2
-    r = cfg["roles"]
+    if not cfg_path:
+        console.print("[yellow]Совет:[/yellow] конфигурации ещё нет — [bold]debate init[/bold] найдёт установленных "
+                      "агентов и раздаст роли.")
+
+    def who(role: str) -> str:
+        ch = role_chain(cfg, role)
+        return ch[0] + (f" (запасные: {', '.join(ch[1:])})" if len(ch) > 1 else "")
     srcs = ", ".join(_short(p, repo) for p in cfg_path) or "встроенный"
-    console.print(f"[dim]конфиг: {srcs} · автор: {r['proposer']} · критик: {r['critic']} · "
-                  f"исполнитель: {r['executor']} · ревьюер: {r['reviewer']} · раундов: {cfg['debate']['max_rounds']}[/dim]")
+    console.print(f"[dim]конфиг: {srcs} · автор: {who('proposer')} · критик: {who('critic')} · "
+                  f"исполнитель: {who('executor')} · ревьюер: {who('reviewer')} · раундов: {cfg['debate']['max_rounds']}[/dim]")
     out_dir = cfg["output"]["dir"]
     try:
         from .gitutil import ignored, is_repo
@@ -297,7 +314,7 @@ def cmd_config(args) -> int:
 
     for sec in ("roles", "debate", "exec", "rules", "output"):
         show(f"[{sec}]", cfg[sec], (sec,))
-    names = list(cfg["agents"]) if args.all else list(dict.fromkeys(cfg["roles"].values()))
+    names = list(cfg["agents"]) if args.all else role_agents(cfg, with_fallbacks=True)
     for name in names:
         show(f"[agents.{name}]", cfg["agents"][name], ("agents", name))
     if not args.all:
@@ -402,7 +419,7 @@ def cmd_probe(args) -> int:
     console = Console()
     repo = Path(args.repo).resolve()
     cfg, _ = load_config(Path(args.config) if args.config else None, repo)
-    names = args.agents or list(dict.fromkeys(cfg["roles"].values()))
+    names = args.agents or role_agents(cfg, with_fallbacks=True)
     unknown = [n for n in names if n not in cfg["agents"]]
     if unknown:
         console.print(f"[red]Не описаны агенты:[/red] {', '.join(unknown)}. Есть: {', '.join(cfg['agents'])}")
@@ -463,6 +480,103 @@ def cmd_probe(args) -> int:
     return 0 if ok_all else 1
 
 
+def _version(cmd: str) -> str:
+    """`<cli> --version` — первая строка; не тратит лимиты."""
+    try:
+        r = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=20)
+        return ((r.stdout or r.stderr).strip().splitlines() or ["?"])[0][:60]
+    except Exception as e:
+        return f"? ({type(e).__name__})"
+
+
+def cmd_init(args) -> int:
+    """`debate init` — найти установленные CLI агентов, проверить вход и раздать роли.
+
+    Результат — раздел [roles] в ~/.config/debate/config.toml (или в .debate/config.toml репозитория с --here).
+    Остальные разделы файла не трогаются. Для каждой роли — основной агент и запасные: если у основного
+    кончится лимит, ход сам перейдёт к следующему.
+    """
+    console = Console()
+    ui = ConsoleUI(console)
+    repo = Path(args.repo).resolve()
+    cfg, _ = load_config(Path(args.config) if args.config else None, repo)
+    target = repo / ".debate" / "config.toml" if args.here else GLOBAL_CONFIG
+
+    found = [k for k in KINDS if shutil.which(cfg["agents"][k]["cmd"])]
+    t = Table(title="Агенты (CLI)", show_lines=False)
+    for col in ("агент", "команда", "версия", "вход"):
+        t.add_column(col)
+    if not found:
+        console.print("[red]Не найдено ни одного CLI агента.[/red] Поддерживаются: "
+                      + ", ".join(f"{k} ({cfg['agents'][k]['cmd']})" for k in KINDS)
+                      + ". Установите хотя бы два и запустите debate init ещё раз.")
+        return 1
+    check = not args.no_check and (args.yes or ui.choose(
+        "Проверить вход?",
+        f"Найдено: {', '.join(found)}. Чтобы убедиться, что вход выполнен и лимит не исчерпан, каждому агенту "
+        "уйдёт один короткий запрос (несколько секунд, минимум токенов).",
+        {"y": "проверить", "n": "не проверять"}) == "y")
+    usable: list[str] = []
+    tmp = Path(tempfile.mkdtemp(prefix="debate-init-"))
+    for k in KINDS:
+        cmd = cfg["agents"][k]["cmd"]
+        if k not in found:
+            t.add_row(k, cmd, "—", "[dim]не установлен[/dim]")
+            continue
+        ver = _version(cmd)
+        status = "[dim]не проверялся[/dim]"
+        if check:
+            agent = Agent.from_cfg(k, "critic", cfg["agents"][k], 180, None)
+            try:
+                with ui.working(f"{k}: проверка входа"):
+                    agent.ask("Reply with the single word OK.", cwd=tmp)
+                status = "[green]ok[/green]"
+            except AgentError as e:
+                status = "[red]ошибка[/red]: " + escape(str(e).splitlines()[0][:80])
+                t.add_row(k, cmd, escape(ver), status)
+                continue
+        usable.append(k)
+        t.add_row(k, cmd, escape(ver), status)
+    console.print(t)
+    if not usable:
+        console.print("[red]Ни один агент не ответил.[/red] Выполните вход в CLI (например, `claude`, `grok auth login`, "
+                      "`opencode auth login`) и повторите.")
+        return 1
+
+    roles = suggest_roles(usable)
+    while True:
+        console.print(Panel(roles_toml(roles).rstrip(), title=f"Предлагаемые роли → {target}", border_style="cyan"))
+        if len(usable) == 1:
+            console.print("[yellow]Доступен один агент: он будет спорить сам с собой — пользы от критики мало.[/yellow]")
+        if args.yes:
+            ch = "y"
+        else:
+            ch = ui.choose("Роли", "Первый агент в списке — основной, остальные — запасные на случай лимита. "
+                           "Модель у каждого — та, что выбрана в самом CLI (сменить: debate models <агент>, "
+                           "[agents.<агент>] model = …).",
+                           {"y": "записать", "e": "изменить", "q": "выйти без записи"})
+        if ch == "q":
+            return 0
+        if ch == "y":
+            break
+        raw = ui.text("Строки вида роль=агент[,запасной…], например: critic=opencode,grok")
+        for line in raw.replace(";", "\n").splitlines():
+            k, _, v = line.partition("=")
+            k, names = k.strip(), [x.strip() for x in v.split(",") if x.strip()]
+            if k not in roles or not names:
+                console.print(f"[red]Пропущено:[/red] {escape(line)} (роли: {', '.join(roles)})")
+                continue
+            unknown = [n for n in names if n not in cfg["agents"]]
+            if unknown:
+                console.print(f"[red]Пропущено:[/red] нет агентов {', '.join(unknown)}")
+                continue
+            roles[k] = names
+    write_roles(target, roles)
+    console.print(f"[green]Записано:[/green] {target}. Проверить: [bold]debate config[/bold]; "
+                  "подробная проверка агентов: [bold]debate probe[/bold].")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Точка входа. Прерывание (Ctrl+C, Ctrl+D) на любом уровне — короткое сообщение, без трейсбека."""
     ap = argparse.ArgumentParser(prog="debate", description="Оркестратор спора консольных ИИ-агентов: план → критика → согласие → исполнение → ревью")
@@ -480,8 +594,18 @@ def main(argv: list[str] | None = None) -> int:
                    help="модель агента на этот запуск: --model opencode=deepseek/deepseek-chat")
     r.add_argument("--rounds", type=int, help="максимум раундов до эскалации")
     r.add_argument("--no-exec", action="store_true", help="только обсуждение, без исполнения")
-    r.add_argument("--in-place", action="store_true", help="исполнять в самом репозитории, без worktree")
+    r.add_argument("--worktree", action="store_true",
+                   help="исполнять в отдельном git worktree рядом с репозиторием (можно работать параллельно)")
+    r.add_argument("--in-place", action="store_true", help="исполнять в самом репозитории (по умолчанию)")
     r.set_defaults(func=cmd_run)
+
+    it = sub.add_parser("init", help="найти установленные CLI агентов и раздать роли")
+    it.add_argument("--here", action="store_true", help="записать роли в .debate/config.toml этого репозитория")
+    it.add_argument("--no-check", action="store_true", help="не проверять вход (без запросов к агентам)")
+    it.add_argument("-y", "--yes", action="store_true", help="проверить и записать без вопросов")
+    it.add_argument("--repo", default=".")
+    it.add_argument("--config")
+    it.set_defaults(func=cmd_init)
 
     p = sub.add_parser("probe", help="проверить CLI агентов: ответ, сессия, read-only")
     p.add_argument("agents", nargs="*", help="какие агенты (по умолчанию — назначенные в [roles])")

@@ -1,4 +1,4 @@
-"""Небольшие обёртки над git: проверка репозитория, worktree для исполнителя и дифф для ревьюера."""
+"""Небольшие обёртки над git: ветка или worktree для исполнителя, проверка незакоммиченного, дифф для ревьюера."""
 from __future__ import annotations
 
 import subprocess
@@ -38,14 +38,50 @@ def add_worktree(repo: Path, slug: str) -> tuple[Path, str]:
     return path, branch
 
 
-def staged_diff(path: Path, limit: int) -> tuple[str, str, bool]:
+def _excl(exclude: list[str]) -> list[str]:
+    """pathspec «всё, кроме»: `. :(exclude).debate` — служебные файлы обсуждения не трогаем."""
+    return ["--", ".", *[f":(exclude){x}" for x in exclude]] if exclude else []
+
+
+def current_branch(path: Path) -> str | None:
+    """Текущая ветка; None — если HEAD отсоединён."""
+    name = git(["rev-parse", "--abbrev-ref", "HEAD"], path).strip()
+    return None if name == "HEAD" else name
+
+
+def has_branch(path: Path, branch: str) -> bool:
+    return subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+                          cwd=str(path), capture_output=True).returncode == 0
+
+
+def dirty(path: Path, exclude: list[str] | None = None) -> str:
+    """`git status --short` без служебных путей; пусто — рабочее дерево чистое."""
+    return git(["status", "--short", "--untracked-files=all", *_excl(exclude or [])], path).strip()
+
+
+def stash(path: Path, message: str, exclude: list[str] | None = None) -> None:
+    """Прячет все незакоммиченные изменения, включая новые файлы (`git stash -u`), кроме служебных путей."""
+    git(["stash", "push", "-u", "-m", message, *_excl(exclude or [])], path)
+
+
+def switch_branch(path: Path, branch: str) -> bool:
+    """Переключает рабочую копию на ветку `branch`, создавая её от HEAD, если её нет. True — ветка создана."""
+    if has_branch(path, branch):
+        git(["switch", branch], path)
+        return False
+    git(["switch", "-c", branch], path)
+    return True
+
+
+def staged_diff(path: Path, limit: int, exclude: list[str] | None = None) -> tuple[str, str, bool]:
     """Индексирует все изменения (включая новые файлы) и возвращает (stat, diff, был ли дифф обрезан).
 
     Индексация нужна, чтобы новые файлы исполнителя попали в дифф для ревьюера. Коммит не делается —
-    его делает пользователь после проверки. При исполнении без worktree (--in-place) в индекс попадут
-    и ваши собственные незакоммиченные изменения.
+    его делает пользователь после проверки. `exclude` — служебные пути (каталог .debate), их не индексируем.
+    Перед исполнением в репозитории оркестратор проверяет, что незакоммиченных изменений нет, — иначе
+    в индекс попали бы и ваши правки.
     """
-    git(["add", "-A"], path)
+    git(["add", "-A", *_excl(exclude or [])], path)
     stat = git(["diff", "--cached", "--stat"], path)
     diff = git(["diff", "--cached"], path)
     truncated = len(diff) > limit

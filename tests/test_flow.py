@@ -70,6 +70,7 @@ def test_full_cycle():
         tmp = Path(t)
         repo, cfg = setup(tmp)
         # тексты: ответ на вопрос критика; выборы: план → го, итог → ок
+        cfg["exec"]["use_worktree"] = True
         ui = ScriptUI(choices=["g", "o"], texts=["Тяжёлый прогон нельзя"])
         e = Engine(cfg, repo, ui, brief="Сделать фичу feature")
         e.run()
@@ -341,6 +342,7 @@ def test_agent_gets_pwd_of_workdir():
         repo, cfg = setup(tmp)
         cfg["agents"]["opencode"]["cmd"] = make_wrapper(tmp, "opencode", tmp / "state")
         cfg["roles"]["executor"] = "opencode"
+        cfg["exec"]["use_worktree"] = True
         os.environ["PWD"] = str(repo)  # как будто debate запущен из репозитория
         ui = ScriptUI(choices=["g", "o"], texts=["нельзя"])
         e = Engine(cfg, repo, ui, brief="Исполнение в worktree через opencode")
@@ -390,7 +392,231 @@ def test_language_setting():
         assert "Stage: independent_analysis" in first and "in English" in first
 
 
+def test_chained_denial_patterns_and_no_repeat_ask():
+    """Склейка с echo: echo предлагается к разрешению; «ровно эти» — по командам; повторный отказ не спрашивается."""
+    from debate import protocol as P
+    d = [{"tool": "Bash", "cmd": 'ls /x 2>/dev/null | head -n 3; echo "---"; cat /x/p.json'}]
+    assert "Bash(echo:*)" in P.suggest_patterns(d)
+    assert P.exact_patterns(d) == ["Bash(ls /x 2>/dev/null)", "Bash(head -n 3)", 'Bash(echo "---")', "Bash(cat /x/p.json)"]
+    os.environ["FAKE_DENY"] = os.environ["FAKE_DENY_REPEAT"] = "1"
+    try:
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            repo, cfg = setup(tmp)
+            ui = ScriptUI(choices=["w", "q"], texts=["нельзя"])
+            e = Engine(cfg, repo, ui, brief="Нужен стенд")
+            e.run()
+            asks = [x for x in ui.log if x[:2] == ("choose", "Агенту нужно разрешение")]
+            assert len(asks) == 1, asks
+            assert any(x[0] == "info" and "снова получил отказ" in x[1] for x in ui.log)
+    finally:
+        os.environ.pop("FAKE_DENY"); os.environ.pop("FAKE_DENY_REPEAT")
+
+
+def test_review_limit_escalates_to_user():
+    """Лимит кругов ревью исчерпан с blocker → меню пользователю; поля замечаний не по схеме приводятся к схеме."""
+    os.environ["FAKE_REVIEW_NEVER"] = "1"
+    try:
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            repo, cfg = setup(tmp)
+            cfg = deep_merge(cfg, {"exec": {"max_review_rounds": 1}})
+            # план → го; лимит → ещё круг; лимит снова → принять; итог → ок
+            ui = ScriptUI(choices=["g", "f", "a", "o"], texts=["Тяжёлый прогон нельзя"])
+            e = Engine(cfg, repo, ui, brief="Сделать фичу feature")
+            e.run()
+            limits = [x for x in ui.log if x[:2] == ("choose", "Ревью не пройдено")]
+            assert len(limits) == 2, limits
+            rv = e.f["exec"]["reviews"][-1]["points"][0]
+            assert rv["claim"] == "поправка не внесена" and rv["evidence"] == "feature.txt:1" and rv["severity"] == "blocker"
+            assert e.f["phase"] == "done" and e.f["exec"]["accepted"]
+            assert not [r for r in list_debates(repo, ".debate") if r["resumable"]]
+            # результат старой версии: завершено без одобрения и без «принять» → resume открывает меню
+            e.f["exec"].pop("accepted")
+            e._save_state()
+            assert [r for r in list_debates(repo, ".debate") if r["resumable"]]
+            ui2 = ScriptUI(choices=["a", "o"], texts=[])
+            Engine(cfg, repo, ui2, resume_dir=e.dir).run()
+            assert ("choose", "Ревью не пройдено") in [x[:2] for x in ui2.log]
+    finally:
+        os.environ.pop("FAKE_REVIEW_NEVER")
+
+
+def git_out(repo, *args):
+    return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+
+
+def test_in_place_branch_and_dirty_tree():
+    """По умолчанию — прямо в репозитории на ветке debate/<имя>; незакоммиченное пользователя — в stash по выбору."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo, cfg = setup(tmp)
+        (repo / "README.md").write_text("моя незакоммиченная правка\n")
+        (repo / "notes.txt").write_text("новый файл пользователя\n")
+        base = git_out(repo, "rev-parse", "--abbrev-ref", "HEAD")
+        # план → го; грязное дерево → спрятать; итог → ок
+        ui = ScriptUI(choices=["g", "h", "o"], texts=["нельзя"])
+        e = Engine(cfg, repo, ui, brief="Сделать фичу feature")
+        e.run()
+        ex = e.f["exec"]
+        assert ex["branch"] == f"debate/{e.slug}" and ex["base_branch"] == base and ex["stashed"]
+        assert git_out(repo, "rev-parse", "--abbrev-ref", "HEAD") == f"debate/{e.slug}"
+        assert (repo / "feature.txt").read_text() == "done fix\n"           # исполнитель работал в репозитории
+        assert not (repo.parent / f"repo-wt-{e.slug}").exists()             # worktree не создавался
+        assert (repo / "README.md").read_text() == "hi\n" and not (repo / "notes.txt").exists()
+        assert "debate: перед исполнением" in git_out(repo, "stash", "list")
+        staged = git_out(repo, "diff", "--cached", "--name-only").splitlines()
+        assert staged == ["feature.txt"], staged                            # ни правок пользователя, ни .debate
+        final = [x for x in ui.log if x[:2] == ("choose", "Исполнение завершено")]
+        assert final
+        assert e._finish_hint(ex, repo).count("git stash pop") == 1
+
+
+def test_in_place_with_unignored_debate_dir():
+    """.debate не в .gitignore: служебные файлы не считаются «незакоммиченным» и не попадают в дифф."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo, cfg = setup(tmp)
+        (repo / ".gitignore").write_text("")
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "no ignore"], cwd=repo, check=True)
+        ui = ScriptUI(choices=["g", "o"], texts=["нельзя"])   # меню «незакоммиченные изменения» не должно появиться
+        e = Engine(cfg, repo, ui, brief="Сделать фичу feature")
+        e.run()
+        staged = git_out(repo, "diff", "--cached", "--name-only").splitlines()
+        assert staged == ["feature.txt"], staged
+
+
+def test_legacy_worktree_exec_resume():
+    """Обсуждение старой версии, исполнявшееся в worktree (без флага worktree в state): resume не трогает ветки репо."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo, cfg = setup(tmp)
+        cfg["exec"]["use_worktree"] = True
+        ui = ScriptUI(choices=["g", "o"], texts=["нельзя"])
+        e = Engine(cfg, repo, ui, brief="Сделать фичу feature")
+        e.run()
+        e.f["exec"].pop("worktree")
+        e.f["exec"]["step"] = "review"
+        e.f["phase"] = "exec"
+        e._save_state()
+        base = git_out(repo, "rev-parse", "--abbrev-ref", "HEAD")
+        cfg["exec"]["use_worktree"] = False
+        ui2 = ScriptUI(choices=["o"], texts=[])
+        e2 = Engine(cfg, repo, ui2, resume_dir=e.dir)
+        e2.run()
+        assert ("choose", "Открыта другая ветка") not in [x[:2] for x in ui2.log]
+        assert git_out(repo, "rev-parse", "--abbrev-ref", "HEAD") == base
+        assert "git worktree remove" in e2._finish_hint(e2.f["exec"], Path(e2.f["exec"]["workdir"]))
+
+
+def test_fallback_chain_on_limit():
+    """critic/reviewer = [grok, opencode]: у grok лимит → роль сама уходит opencode с вводной; grok больше не зовут."""
+    os.environ["FAKE_LIMIT"] = "grok"
+    try:
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            repo, cfg = setup(tmp)
+            cfg["agents"]["opencode"]["cmd"] = make_wrapper(tmp, "opencode", tmp / "state")
+            cfg["roles"].update(critic=["grok", "opencode"], reviewer=["grok", "opencode"])
+            ui = ScriptUI(choices=["g", "o"], texts=["нельзя"])
+            e = Engine(cfg, repo, ui, brief="Сделать фичу feature")
+            e.run()
+            assert e.f["phase"] == "done"
+            assert e.roles["critic"].name == "opencode" and e.roles["reviewer"].name == "opencode"
+            assert e.f["exhausted"] == ["grok"] and not e.f["takeover"]
+            assert not [x for x in ui.log if x[0] == "choose" and x[1].startswith("Ошибка")]   # без вопросов
+            raw = e.dir / "raw"
+            assert len(list(raw.glob("*-grok.prompt.md"))) == 1                # grok попробовали один раз
+            first_oc = sorted(raw.glob("critic-*-opencode.prompt.md"))[0].read_text()
+            assert "taking over the role" in first_oc and "Сделать фичу feature" in first_oc
+            first_rv = sorted(raw.glob("reviewer-*-opencode.prompt.md"))[0].read_text()
+            assert "taking over the role" in first_rv
+            assert "Смена агента" in (e.dir / "transcript.md").read_text()
+    finally:
+        os.environ.pop("FAKE_LIMIT")
+
+
+def test_quoted_separators_and_no_bare_write():
+    """Разделители внутри кавычек не режут команду; голое `Write` в подсказках не появляется."""
+    from debate import protocol as P
+    assert P.split_raw("grep -e 'a; b|c' f && echo \"x;y\" 2>&1 | head") == ["grep -e 'a; b|c' f", 'echo "x;y" 2>&1', "head"]
+    assert P.suggest_patterns([{"tool": "Bash", "cmd": "rg 'class\": x; y' src"}]) == ["Bash(rg:*)"]
+    assert P.suggest_patterns([{"tool": "Write", "cmd": "notes.md"}]) == []
+    assert P.suggest_patterns([{"tool": "Write", "cmd": "/tmp/x/a.txt"}]) == ["Write(//tmp/x/**)"]
+    assert P.is_unavailable("Error: usage limit reached") and not P.is_unavailable("syntax error in reply")
+
+
+def test_suggest_and_write_roles():
+    """Раздача ролей: критик — другой агент; запись [roles] не трогает остальные разделы."""
+    from debate.config import suggest_roles, write_roles
+    r = suggest_roles(["grok", "claude", "opencode"])
+    assert r["proposer"] == ["claude", "opencode"] and r["critic"] == ["grok", "opencode"]
+    assert r["executor"] == r["proposer"] and r["reviewer"] == r["critic"]
+    assert suggest_roles(["opencode"])["critic"] == ["opencode"]
+    assert suggest_roles(["claude", "qwen"])["critic"] == ["qwen"]
+    with tempfile.TemporaryDirectory() as t:
+        f = Path(t) / "c.toml"
+        f.write_text('[roles]\ncritic = "x"\n\n[rules]\nlanguage = "en"\n')
+        write_roles(f, r)
+        import tomllib
+        data = tomllib.loads(f.read_text())
+        assert data["rules"]["language"] == "en" and data["roles"]["critic"] == ["grok", "opencode"]
+        assert data["roles"]["proposer"] == ["claude", "opencode"]
+
+
+def test_init_command_with_fakes():
+    """debate init --here -y: находит CLI (обёртки), проверяет вход и пишет роли в .debate/config.toml."""
+    from debate.cli import main
+    import tomllib
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo, _ = setup(tmp)
+        cfgf = repo / ".debate" / "config.toml"
+        cfgf.parent.mkdir()
+        cfgf.write_text(f'[agents.claude]\ncmd = "{make_wrapper(tmp, "claude", tmp / "state")}"\n'
+                        f'[agents.opencode]\ncmd = "{make_wrapper(tmp, "opencode", tmp / "state")}"\n'
+                        '[agents.grok]\ncmd = "/nonexistent/grok"\n[agents.qwen]\ncmd = "/nonexistent/qwen"\n')
+        assert main(["init", "--here", "-y", "--repo", str(repo)]) == 0
+        data = tomllib.loads(cfgf.read_text())
+        assert data["roles"] == {"proposer": "claude", "critic": "opencode", "executor": "claude", "reviewer": "opencode"}
+        assert data["agents"]["claude"]["cmd"].endswith("claude")
+
+
+def test_replan_from_execution():
+    """Ревью не пройдено → «вернуть план на обсуждение»: автор и критик пересматривают, исполнитель доводит то же."""
+    os.environ["FAKE_REVIEW_NEVER"] = "1"
+    try:
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            repo, cfg = setup(tmp)
+            cfg = deep_merge(cfg, {"exec": {"max_review_rounds": 0}})
+            ui = ScriptUI(choices=["g", "p", "g", "a", "o"], texts=["Тяжёлый прогон нельзя", "дело в плане"])
+            e = Engine(cfg, repo, ui, brief="Сделать фичу feature")
+            e.run()
+            assert e.f["phase"] == "done", e.f["phase"]
+            raw = e.dir / "raw"
+            ex_prompts = [p.read_text() for p in sorted(raw.glob("executor-*.prompt.md"))]
+            assert any("The plan was revised after your previous implementation" in p for p in ex_prompts)
+            prop = [p.read_text() for p in sorted(raw.glob("proposer-*.prompt.md"))]
+            assert any("back for discussion after execution" in p and "дело в плане" in p for p in prop)
+            branches = git_out(repo, "branch", "--list", "debate/*").split()
+            assert len([b for b in branches if b.startswith("debate/")]) == 1   # ветка та же, новой не создано
+            assert "Пересмотр плана после исполнения" in (e.dir / "transcript.md").read_text()
+    finally:
+        os.environ.pop("FAKE_REVIEW_NEVER")
+
+
 if __name__ == "__main__":
+    test_replan_from_execution()
+    test_suggest_and_write_roles()
+    test_init_command_with_fakes()
+    test_fallback_chain_on_limit()
+    test_quoted_separators_and_no_bare_write()
+    test_legacy_worktree_exec_resume()
+    test_in_place_branch_and_dirty_tree()
+    test_in_place_with_unignored_debate_dir()
+    test_review_limit_escalates_to_user()
+    test_chained_denial_patterns_and_no_repeat_ask()
     test_language_setting()
     test_agent_gets_pwd_of_workdir()
     test_layered_config()

@@ -112,7 +112,8 @@ DEFAULTS: dict = {
                         "exec_permission": {"edit": "allow", "webfetch": "deny"}},
         },
     },
-    # Кто какую роль играет. Значения — имена из [agents]; можно завести своих агентов:
+    # Кто какую роль играет. Значения — имена из [agents] или цепочка запасных: critic = ["grok", "opencode"] —
+    # если у первого кончился лимит (или он недоступен), ход сам уходит следующему. Можно завести своих агентов:
     #   [agents.deepseek]
     #   kind = "opencode"
     #   model = "deepseek/deepseek-chat"
@@ -130,7 +131,9 @@ DEFAULTS: dict = {
     },
     "exec": {
         "enabled": True,
-        "use_worktree": True,     # исполнять в отдельном git worktree (ветка debate/<имя обсуждения>)
+        "use_worktree": False,    # true — исполнять в отдельном git worktree рядом с репозиторием (можно работать
+                                  # параллельно, но там нет файлов вне git); false — прямо в репозитории
+        "branch": True,           # исполнять на новой ветке debate/<имя обсуждения> (для worktree — всегда)
         "max_review_rounds": 2,   # циклов «ревью → правки» после первого исполнения
         "diff_char_limit": 60000, # дифф длиннее обрезается в промпте ревьюера
     },
@@ -237,3 +240,71 @@ def _label(p: Path, repo: Path) -> str:
         return str(p.resolve().relative_to(repo.resolve()))
     except ValueError:
         return str(p)
+
+
+def role_chain(cfg: dict, role: str) -> list[str]:
+    """Агенты роли по порядку: основной и запасные. В конфиге роль — строка или список."""
+    v = cfg["roles"].get(role)
+    if isinstance(v, (list, tuple)):
+        return [str(x) for x in v if str(x)]
+    return [str(v)] if v else []
+
+
+def role_agents(cfg: dict, with_fallbacks: bool = False) -> list[str]:
+    """Имена агентов, назначенных на роли (основные или все, включая запасных), без повторов."""
+    out: list[str] = []
+    for role in cfg["roles"]:
+        chain = role_chain(cfg, role)
+        out += chain if with_fallbacks else chain[:1]
+    return list(dict.fromkeys(out))
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# debate init: раздача ролей и запись [roles]
+# ---------------------------------------------------------------------------------------------------------------
+# Предпочтения по умолчанию. Автор и исполнитель — агент, который лучше всего пишет код; критик и ревьюер — по
+# возможности ДРУГОЙ агент: смысл спора в разных моделях, иначе модель соглашается сама с собой.
+AUTHOR_ORDER = ("claude", "opencode", "qwen", "grok")
+CRITIC_ORDER = ("grok", "opencode", "qwen", "claude")
+
+
+def suggest_roles(usable: list[str]) -> dict[str, list[str]]:
+    """Цепочки ролей из доступных агентов: основной + запасные (см. role_chain)."""
+    if not usable:
+        return {}
+    rank = lambda order: sorted(usable, key=lambda n: order.index(n) if n in order else len(order))  # noqa: E731
+    authors, critics = rank(AUTHOR_ORDER), rank(CRITIC_ORDER)
+    author = authors[0]
+    # критик — не автор; автор в цепочке критика только последним запасным, если больше некому
+    critic = [n for n in critics if n != author] or [author]
+    author_chain = [author] + [n for n in authors if n not in (author, critic[0])]
+    return {"proposer": author_chain, "critic": critic, "executor": list(author_chain), "reviewer": list(critic)}
+
+
+def roles_toml(roles: dict[str, list[str]]) -> str:
+    """Блок [roles] в TOML: одиночный агент — строкой, цепочка — списком."""
+    lines = ["[roles]"]
+    for role in ("proposer", "critic", "executor", "reviewer"):
+        chain = roles.get(role) or []
+        if not chain:
+            continue
+        val = f'"{chain[0]}"' if len(chain) == 1 else "[" + ", ".join(f'"{n}"' for n in chain) + "]"
+        lines.append(f"{role} = {val}")
+    return "\n".join(lines) + "\n"
+
+
+def write_roles(path: Path, roles: dict[str, list[str]]) -> None:
+    """Записывает [roles] в файл конфигурации, не трогая остальные разделы (старый [roles] заменяется)."""
+    old = path.read_text(encoding="utf-8") if path.is_file() else ""
+    kept, skip = [], False
+    for line in old.splitlines():
+        head = line.strip()
+        if head.startswith("[") and not head.startswith("[["):
+            skip = head == "[roles]"
+        if not skip:
+            kept.append(line)
+    body = "\n".join(kept).rstrip()
+    text = (body + "\n\n" if body else "# Конфигурация debate (см. debate.example.toml)\n\n") + roles_toml(roles)
+    tomllib.loads(text)  # не записываем то, что потом не прочитается
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")

@@ -264,12 +264,15 @@ class Agent:
         # PWD обязательно: OpenCode (и, возможно, другие CLI на Node/Bun) определяют каталог проекта по $PWD,
         # а не по фактическому cwd процесса — без этого агент работал бы в каталоге, откуда запущен debate
         env = {**os.environ, "PWD": str(cwd), **extra_env}
-        proc = subprocess.Popen(
-            argv, cwd=str(cwd), text=True, encoding="utf-8", errors="replace", env=env,
-            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            start_new_session=True,  # Ctrl+C обрабатываем сами и гасим всю группу
-        )
+        try:
+            proc = subprocess.Popen(
+                argv, cwd=str(cwd), text=True, encoding="utf-8", errors="replace", env=env,
+                stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True,  # Ctrl+C обрабатываем сами и гасим всю группу
+            )
+        except FileNotFoundError:
+            raise AgentError(f"{self.name}: команда {self.cmd!r} не найдена (not found)")
         try:
             out, err = proc.communicate(stdin, timeout=self.timeout_s)
         except subprocess.TimeoutExpired:

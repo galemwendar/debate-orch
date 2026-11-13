@@ -231,14 +231,91 @@ _TWO_WORD = {"git", "docker", "docker-compose", "kubectl", "npm", "pnpm", "yarn"
              "systemctl", "apt", "cargo", "go"}
 
 
+def split_raw(cmd: str) -> list[str]:
+    """Склейку shell-команд → исходные тексты команд. Делит по `;`, `&&`, `||`, `|`, `&` и переводам строк,
+    но не внутри кавычек и не после `\\` (иначе `rg 'a; b'` давал бы мусорные «команды» вроде `b'`)."""
+    parts, cur, quote, i = [], [], None, 0
+    while i < len(cmd or ""):
+        ch = cmd[i]
+        if quote:
+            cur.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < len(cmd):
+                cur.append(cmd[i + 1])
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch == "\\" and i + 1 < len(cmd):
+            cur += [ch, cmd[i + 1]]
+            i += 1
+        elif ch in "'\"":
+            quote = ch
+            cur.append(ch)
+        elif ch in ";|&\n":
+            # `2>&1`, `>&2` — перенаправление, а не разделитель
+            if ch == "&" and cur and cur[-1] in "<>":
+                cur.append(ch)
+            else:
+                parts.append("".join(cur))
+                cur = []
+                if ch in "|&" and i + 1 < len(cmd) and cmd[i + 1] == ch:
+                    i += 1
+        else:
+            cur.append(ch)
+        i += 1
+    parts.append("".join(cur))
+    return [x.strip() for x in parts if x.strip()]
+
+
+# Первое слово команды, для которого есть смысл предлагать шаблон: имя программы или путь к ней.
+_CMD_WORD = re.compile(r"^[\w.+/-]+$")
+
+
+def split_commands(cmd: str) -> list[list[str]]:
+    """Склейку shell-команд (`a && b; c | d`) → список команд, каждая — список слов без присваиваний `X=1`.
+
+    Перенаправления (`2>/dev/null`) остаются словами команды. Пропускаются только `cd`, `export`, `set`, `true`:
+    они ничего не читают и не пишут, и CLI их обычно не проверяют. `echo` НЕ пропускается — его нет в списке
+    разрешённых, и OpenCode/Claude отклоняют склейку именно из-за него. Части, первое слово которых не похоже
+    на имя программы (обрывок строки, подстановка `$(…)`), отбрасываются — шаблон по ним бессмыслен.
+    """
+    import shlex
+    out: list[list[str]] = []
+    for part in split_raw(cmd):
+        try:
+            toks = shlex.split(part)
+        except ValueError:
+            toks = part.split()
+        toks = [t for t in toks if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t)]
+        if toks and toks[0] not in ("cd", "export", "set", "true") and _CMD_WORD.match(toks[0]):
+            out.append(toks)
+    return out
+
+
+def exact_patterns(denials: list[dict]) -> list[str]:
+    """«Разрешить ровно эти команды»: каждая команда склейки — отдельным точным шаблоном `Bash(<команда>)`.
+
+    Шаблон на всю склейку целиком бесполезен: CLI проверяют команды по одной и до него не доходят.
+    """
+    out: list[str] = []
+    for d in denials:
+        if d.get("tool") != "Bash":
+            continue
+        for part in split_raw(d.get("cmd", "")):
+            # исходный текст команды, с кавычками: CLI сравнивают точный шаблон с ним
+            if split_commands(part):
+                pat = f"Bash({part})"
+                if pat not in out:
+                    out.append(pat)
+    return out
+
+
 def suggest_patterns(denials: list[dict]) -> list[str]:
     """Предлагает пользователю как можно более узкие шаблоны разрешений для отклонённых действий.
 
     Shell: по первому слову команды (`Bash(ssh:*)`), для git/docker/npm… — по двум (`Bash(git status:*)`);
-    склейки через `&&`, `;`, `|` разбираются по частям, `cd`/`export`/присваивания пропускаются.
+    склейки через `&&`, `;`, `|` разбираются по частям (см. split_commands).
     Файлы вне рабочего каталога: только их папка (`Write(//tmp/x/**)`). Сайты: только домен.
     """
-    import shlex
     out: list[str] = []
     for d in denials:
         if d.get("tool") != "Bash":
@@ -252,22 +329,16 @@ def suggest_patterns(denials: list[dict]) -> list[str]:
             elif tool == "WebFetch" and re.match(r"https?://", target):
                 host = re.sub(r"^https?://([^/:]+).*", r"\1", target)
                 pat = f"WebFetch(domain:{host})"
+            elif tool in ("Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "WebFetch"):
+                # без абсолютного пути или адреса узкий шаблон не построить, а голое `Write` открыло бы запись
+                # везде (так в одном из прогонов критик и ревьюер получили право писать файлы) — не предлагаем
+                continue
             else:
                 pat = tool
             if pat not in out:
                 out.append(pat)
             continue
-        for part in re.split(r"&&|\|\||;|\|", d.get("cmd", "")):
-            part = part.strip()
-            if not part:
-                continue
-            try:
-                toks = shlex.split(part)
-            except ValueError:
-                toks = part.split()
-            toks = [t for t in toks if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t)]
-            if not toks or toks[0] in ("cd", "export", "set", "true", "echo"):
-                continue
+        for toks in split_commands(d.get("cmd", "")):
             prefix = " ".join(toks[:2]) if toks[0] in _TWO_WORD and len(toks) > 1 and not toks[1].startswith("-") else toks[0]
             pat = f"Bash({prefix}:*)"
             if pat not in out:
@@ -285,14 +356,78 @@ file-reading tools are still available; anything that can only be verified with 
 as unverified ("needs checking: …"). Then give a full reply using the schema required by this turn's task."""
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# Запасные агенты
+# ---------------------------------------------------------------------------------------------------------------
+# Ошибки, после которых агент в ближайшее время не ответит: кончился лимит, не выполнен вход, CLI не найден.
+# Тогда роль переходит к следующему агенту из цепочки ([roles] critic = ["grok", "opencode"]) без вопроса.
+_UNAVAILABLE = re.compile(
+    r"rate.?limit|usage.?limit|limit (?:reached|exceeded|hit)|quota|too many requests|\b429\b|"
+    r"insufficient (?:credit|balance|quota|funds)|out of credits|credits? (?:exhausted|depleted)|exceeded your|"
+    r"billing|subscription|not logged in|log ?in required|please (?:log|sign) ?in|unauthori[sz]ed|\b401\b|"
+    r"invalid api key|authentication|not found|лимит|квот", re.I)
+
+
+def is_unavailable(message: str) -> bool:
+    """Похоже ли сообщение об ошибке агента на «лимит / нет входа / нет CLI» (а не на сбой конкретного хода)."""
+    return bool(_UNAVAILABLE.search(message or ""))
+
+
+def p_takeover(role: str, brief: str, plan: str, version: int, workdir: str | None = None) -> str:
+    """Вводная для агента, который подхватил роль посреди обсуждения: истории прошлого агента у него нет."""
+    where = f"\nWorking directory: {workdir}" if workdir else ""
+    plan_block = f"\n\nCurrent plan (version {version}):\n<plan>\n{plan}\n</plan>" if plan else ""
+    return f"""Context: you are taking over the role "{role}" in the middle of an ongoing discussion from another agent
+(it became unavailable). You do not have its history; everything you need is below and in the task that follows.
+
+Task from the user:
+<task>
+{brief}
+</task>{plan_block}{where}
+
+---
+
+"""
+
+
 # Если в ответе не нашлось разбираемого JSON-блока, агента один раз просят повторить только блок.
 FIX_JSON = """Stage: fix_json
 
 The orchestrator could not parse the JSON block in your previous reply. Repeat the reply as ONLY one valid ```json block using the same schema, with no text around it."""
 
 
+def replan_note(user_note: str, exec_summary: str, review: dict | None) -> str:
+    """Возврат плана на обсуждение с этапа исполнения: что уже сделано и что сказал ревьюер — автору и критику."""
+    rv = ""
+    if review:
+        rv = f"\n\nLast review ({review.get('verdict', '?')}): {review.get('summary', '')}\n{fmt_points(review.get('points', []))}"
+    note = user_note.strip() or "Revisit the plan in light of what execution and review revealed."
+    return (f"The plan is back for discussion after execution. User's request: {note}\n\n"
+            f"The executor has already implemented the current plan version in the working tree (changes are not "
+            f"committed). Executor's last report: {exec_summary or '—'}{rv}\n\n"
+            "Revise the plan where execution or review showed it is wrong or incomplete; keep what already works. "
+            "The executor will then bring the existing changes in line with the new version.")
+
+
+def p_exec_update(plan: str, workdir: str) -> str:
+    """Исполнение после пересмотра плана: изменения прошлой версии уже в рабочем каталоге."""
+    return f"""Stage: execute
+
+The plan was revised after your previous implementation (new version below). Working directory: {workdir}.
+Your earlier changes for the previous version are already in the working tree. Bring them in line with the new
+version: change only what differs, do not redo what already matches. Work only inside the working directory.
+Run heavy or long jobs only if the plan explicitly requires it. Do not commit.
+
+<plan>
+{plan}
+</plan>
+
+Response schema:
+{SCHEMA_EXEC}"""
+
+
 def p_exec(plan: str, workdir: str) -> str:
-    """Исполнитель реализует итоговый plan.md в рабочем каталоге (обычно — отдельный git worktree)."""
+    """Исполнитель реализует итоговый plan.md в рабочем каталоге (репозиторий на ветке debate/… или worktree)."""
     return f"""Stage: execute
 
 Implement the agreed plan. Working directory: {workdir}. Work only inside it.
@@ -371,7 +506,7 @@ def extract_json(text: str) -> dict | None:
         try:
             obj = json.loads(block)
             if isinstance(obj, dict):
-                return obj
+                return normalize_points(obj)
         except Exception:
             pass
     dec = json.JSONDecoder()
@@ -383,8 +518,41 @@ def extract_json(text: str) -> dict | None:
         except Exception:
             continue
         if isinstance(obj, dict) and "verdict" in obj:
-            return obj
+            return normalize_points(obj)
     return None
+
+
+# Модели не всегда держат имена полей из схемы (OpenCode-ревьюер прислал `file`/`text` вместо `evidence`/`claim`).
+# Синонимы приводятся к схеме, чтобы замечание не потерялось ни в таблице, ни в промпте исполнителю.
+_POINT_ALIASES = {
+    "claim": ("text", "description", "issue", "problem", "message", "comment", "summary", "title"),
+    "evidence": ("file", "location", "where", "path", "ref", "proof"),
+    "suggestion": ("fix", "recommendation", "proposal", "action", "how_to_fix"),
+    "severity": ("level", "priority"),
+}
+
+
+def normalize_points(data: dict | None) -> dict | None:
+    """Приводит поля замечаний к схеме (claim/evidence/suggestion/severity); исходные ключи не удаляются."""
+    if not isinstance(data, dict) or not isinstance(data.get("points"), list):
+        return data
+    pts = []
+    for pt in data["points"]:
+        if isinstance(pt, str):
+            pt = {"claim": pt}
+        if not isinstance(pt, dict):
+            continue
+        for key, alts in _POINT_ALIASES.items():
+            if not pt.get(key):
+                for a in alts:
+                    if pt.get(a):
+                        pt[key] = pt[a]
+                        break
+        if isinstance(pt.get("severity"), str):
+            pt["severity"] = pt["severity"].strip().lower()
+        pts.append(pt)
+    data["points"] = pts
+    return data
 
 
 def blocking_points(data: dict) -> list[dict]:

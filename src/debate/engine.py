@@ -6,7 +6,7 @@
     debate      раунды: критик → (согласие? → plan_ready) → автор отвечает на пункты и правит план → критик …
                 при исчерпании раундов или тупике (те же пункты отклонены дважды) — эскалация пользователю
     plan_ready  план показан пользователю: «го» → exec, комментарий → снова debate, выход → можно продолжить позже
-    exec        worktree → исполнитель → ревьюер → правки → ревьюер … → итог
+    exec        ветка (или worktree) → исполнитель → ревьюер → правки → ревьюер … → итог
     done        завершено
 
 Порядок ходов задаёт код: каждый ответ агента заканчивается JSON-блоком с вердиктом, и движок по нему решает,
@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from contextlib import AbstractContextManager
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,7 @@ from typing import Callable, Protocol
 from . import gitutil
 from . import protocol as P
 from .agents import Agent, AgentError, TurnResult
+from .config import role_chain
 
 SCHEMA = 1  # версия формата state.json; старые форматы поднимаются в _upgrade_legacy()
 PHASE_RU = {"start": "начало", "debate": "обсуждение", "plan_ready": "план ждёт решения",
@@ -85,7 +87,7 @@ class Engine:
             self.dir = self.repo / cfg["output"]["dir"] / self.slug
             (self.dir / "raw").mkdir(parents=True, exist_ok=True)
             (self.dir / "brief.md").write_text(self.brief + "\n", encoding="utf-8")
-            role_names = dict(cfg["roles"])
+            role_names = {r: role_chain(cfg, r)[0] for r in cfg["roles"]}
 
         self.roles: dict[str, Agent] = {}
         for role, name in role_names.items():
@@ -110,6 +112,9 @@ class Engine:
             a.calls = prev.calls
             self.roles[role] = a
             self.replaced.append(f"{role}: {prev.name} → {name}")
+        self.timeout = timeout
+        # цепочки запасных берутся из текущего конфига (и при продолжении тоже)
+        self.chains: dict[str, list[str]] = {r: role_chain(cfg, r) for r in cfg["roles"]}
 
         # Состояние, которое переживает перезапуск (см. _save_state):
         #   notes           комментарии пользователя, ещё не доставленные агенту каждой роли;
@@ -126,6 +131,17 @@ class Engine:
         self.f.setdefault("grants", [])       # для обсуждения и ревью
         self.f.setdefault("grants_exec", [])  # для исполнения
         self.f.setdefault("declined", [])     # отклонённые пользователем действия: повторно о них не спрашиваем
+        self.f.setdefault("exhausted", [])    # агенты, у которых кончился лимит / нет входа: в этом обсуждении не зовём
+        self.f.setdefault("takeover", [])     # роли, чей агент сменился: следующему ходу нужна вводная
+        for line in self.replaced:
+            role = line.split(":", 1)[0]
+            if role not in self.f["takeover"]:
+                self.f["takeover"].append(role)
+        if resume_dir is not None and _review_unresolved(self.f):
+            # исполнение закончилось без одобрения ревьюера (старая версия просто завершала его):
+            # продолжение открывает меню «ещё круг правок / принять как есть»
+            self.f["phase"] = "exec"
+            self.f["exec"]["step"] = "review_limit"
         self._apply_grants()
         self.transcript = self.dir / "transcript.md"
         if resume_dir is None:
@@ -274,7 +290,12 @@ class Engine:
         if ch == "q":
             return False
         if ch == "g":
-            if self.cfg["exec"]["enabled"]:
+            ex = self.f.get("exec") or {}
+            if self.cfg["exec"]["enabled"] and ex.get("replan"):
+                # план пересмотрен с этапа исполнения: та же ветка/папка, исполнитель доводит уже сделанное
+                ex.update(step="execute", review_round=0, reviews=[])
+                self.f["phase"] = "exec"
+            elif self.cfg["exec"]["enabled"]:
                 self.f.update(phase="exec", exec={"step": "setup"})
             else:
                 self.ui.info("Исполнение отключено в конфиге ([exec] enabled = false).")
@@ -293,31 +314,38 @@ class Engine:
         ex_cfg = self.cfg["exec"]
         ex = self.f.setdefault("exec", {"step": "setup"})
         plan_text = (self.dir / "plan.md").read_text(encoding="utf-8")
+        self._check_branch(ex)
         while True:
             step = ex["step"]
             wd = Path(ex["workdir"]) if ex.get("workdir") else self.repo
 
             if step == "setup":
-                ex.update(workdir=str(self.repo), branch=None)
-                if ex_cfg["use_worktree"] and gitutil.is_repo(self.repo):
+                ex.update(workdir=str(self.repo), branch=None, base_branch=None, stashed=False, worktree=False)
+                is_git = gitutil.is_repo(self.repo)
+                if ex_cfg["use_worktree"] and is_git:
                     try:
                         path, branch = gitutil.add_worktree(gitutil.toplevel(self.repo), self.slug)
-                        ex.update(workdir=str(path), branch=branch)
-                        self.ui.info(f"Создан worktree {path} (ветка {branch}). Файлы вне git (данные, .env, модели) "
-                                     "там отсутствуют — при необходимости отключите worktree: "
-                                     "[exec] use_worktree = false или debate run --in-place.")
+                        ex.update(workdir=str(path), branch=branch, worktree=True,
+                                  base_branch=gitutil.current_branch(self.repo))
+                        self.ui.info(f"Создан worktree {path} (ветка {branch}). Файлы вне git (данные, .env, "
+                                     "node_modules) там отсутствуют.")
                     except Exception as e:
                         if self.ui.choose("Не удалось создать worktree", str(e),
                                           {"i": "исполнять прямо в репозитории", "s": "остановить"}) == "s":
                             raise Stopped
-                elif ex_cfg["use_worktree"]:
-                    if self.ui.choose("Каталог не git-репозиторий", "Worktree создать нельзя.",
+                if not ex["worktree"] and is_git:
+                    self._prepare_in_place(ex)
+                elif not is_git:
+                    if self.ui.choose("Каталог не git-репозиторий",
+                                      "Ни ветку, ни worktree создать нельзя, а ревью диффа будет пропущено.",
                                       {"i": "исполнять прямо в каталоге", "s": "остановить"}) == "s":
                         raise Stopped
                 ex["step"] = "execute"
 
             elif step == "execute":
-                e = self._turn("executor", P.p_exec(plan_text, str(wd)), mode="exec", cwd=wd)
+                prompt = (P.p_exec_update if ex.get("replan") else P.p_exec)(plan_text, str(wd))
+                e = self._turn("executor", prompt, mode="exec", cwd=wd)
+                ex.pop("replan", None)
                 e = self._questions("executor", e,
                                     lambda: self._turn("executor", P.p_continue(), mode="exec", cwd=wd))
                 ex.update(step="review", last_exec=e.get("summary", ""), review_round=0, reviews=[])
@@ -327,7 +355,7 @@ class Engine:
                     self.ui.info("Каталог не git-репозиторий — автоматическое ревью диффа пропущено.")
                     ex["step"] = "final"
                 else:
-                    stat, diff, trunc = gitutil.staged_diff(wd, int(ex_cfg["diff_char_limit"]))
+                    stat, diff, trunc = gitutil.staged_diff(wd, int(ex_cfg["diff_char_limit"]), self._service_paths())
                     if not diff.strip():
                         self.ui.info("Исполнитель не внёс изменений.")
                         ex["step"] = "final"
@@ -341,9 +369,40 @@ class Engine:
                         if ex["verdict"].lower() == "approve" and not P.blocking_points(rv):
                             ex["step"] = "final"
                         elif ex["review_round"] >= int(ex_cfg["max_review_rounds"]):
-                            ex["step"] = "final"
+                            ex["step"] = "review_limit"
                         else:
                             ex["step"] = "fix"
+
+            elif step == "review_limit":
+                # Лимит кругов «ревью → правки» исчерпан, а ревьюер не одобрил: решает пользователь,
+                # а не молчаливое «исполнение завершено» с открытым blocker.
+                rv = ex["reviews"][-1]
+                block = P.blocking_points(rv)
+                body = (f"Кругов «ревью → правки»: {ex['review_round'] + 1} (лимит [exec] max_review_rounds = "
+                        f"{ex_cfg['max_review_rounds']}). Ревьюер не одобрил:\n\n{rv.get('summary', '')}\n\n"
+                        + (P.fmt_points(block) if block else "Существенных замечаний нет, только minor."))
+                ch = self.ui.choose("Ревью не пройдено", body, {
+                    "f": "ещё один круг правок",
+                    "n": "комментарий исполнителю и круг правок (например: что из замечаний не делать)",
+                    "p": "вернуть план на обсуждение автору и критику (если дело в самом плане)",
+                    "a": "принять как есть и завершить",
+                    "s": "остановить (продолжить потом через debate resume)"})
+                if ch == "s":
+                    raise Stopped
+                if ch == "p":
+                    self._replan(ex, rv)
+                    return
+                if ch == "a":
+                    self._t("\n> **Пользователь принял результат исполнения, несмотря на замечания ревьюера.**\n")
+                    ex.update(step="final", accepted=True)
+                else:
+                    if ch == "n":
+                        note = self.ui.text("Комментарий исполнителю")
+                        if note:
+                            self.notes["executor"].append(note)
+                            self.notes["reviewer"].append(note)
+                            self._t(f"\n> **Пользователь (исполнителю и ревьюеру):** {note}\n")
+                    ex["step"] = "fix"
 
             elif step == "fix":
                 e = self._turn("executor", P.p_fix(ex["reviews"][-1]), mode="exec", cwd=wd)
@@ -355,17 +414,146 @@ class Engine:
                 (self.dir / "review.json").write_text(json.dumps(ex.get("reviews", []), ensure_ascii=False, indent=2),
                                                       encoding="utf-8")
                 stat = gitutil.git(["diff", "--cached", "--stat"], wd) if gitutil.is_repo(wd) else ""
-                branch = ex.get("branch")
-                how = (f"Проверьте и закоммитьте, затем слейте ветку `{branch}` в свою:\n\n"
-                       f"```\ncd {wd}\ngit diff --cached\ngit commit -m '...'\n```" if branch else
-                       "Изменения в рабочей копии репозитория (проиндексированы, не закоммичены).")
+                how = self._finish_hint(ex, wd)
                 self.f["phase"] = "done"
                 self._save_state()
                 self.ui.choose("Исполнение завершено",
                                f"Вердикт ревью: **{ex.get('verdict', '—')}**\n\n```\n{stat.strip() or '(нет изменений)'}\n```"
                                f"\n\n{how}", {"o": "ок"})
                 return
+
+            else:  # неизвестный шаг из state.json более новой версии — не крутимся впустую
+                raise Stopped
             self._save_state()
+
+    # ---------- пересмотр плана с этапа исполнения ----------
+    def _replan(self, ex: dict, review: dict | None) -> None:
+        """Исполнение → обсуждение: автор пересматривает план с учётом сделанного и ревью, критик проверяет,
+        после «го» исполнитель доводит уже внесённые изменения до новой версии (ветка и папка те же)."""
+        user_note = self.ui.text("Что обсудить (пусто — пересмотреть план по итогам исполнения и ревью)")
+        self._t("\n## Пересмотр плана после исполнения\n")
+        self._broadcast(P.replan_note(user_note, ex.get("last_exec", ""), review), ("proposer", "critic"))
+        ex["replan"] = True
+        self._new_debate("proposer_note")
+
+    # ---------- запасные агенты ----------
+    def _next_agent(self, role: str) -> str | None:
+        """Следующий доступный агент из цепочки роли: описан в [agents], есть в PATH, не исчерпан в этом обсуждении."""
+        chain = self.chains.get(role) or []
+        cur = self.roles[role].name
+        rest = chain[chain.index(cur) + 1:] if cur in chain else chain
+        for name in rest:
+            a = self.cfg["agents"].get(name)
+            if a and name != cur and name not in self.f["exhausted"] and shutil.which(a.get("cmd", name)):
+                return name
+        return None
+
+    def _switch(self, role: str, name: str, reason: str) -> None:
+        """Передаёт роль агенту `name`: новая сессия, следующий ход получит вводную (задача, план)."""
+        prev = self.roles[role]
+        a = Agent.from_cfg(name, role, self.cfg["agents"][name], self.timeout, self.dir / "raw")
+        a.calls = prev.calls
+        a.grants, a.grants_exec = list(self.f["grants"]), list(self.f["grants_exec"])
+        self.roles[role] = a
+        if role not in self.f["takeover"]:
+            self.f["takeover"].append(role)
+        msg = f"{P.ROLE_RU[role]}: {prev.name} → {name} (причина: {reason})"
+        self.ui.info(f"Роль передана запасному агенту. {msg}")
+        self._t(f"\n*Смена агента. {msg}*\n")
+        self._save_state()
+
+    # ---------- где исполнять ----------
+    def _service_paths(self) -> list[str]:
+        """Служебный каталог обсуждений (.debate) — его не прячем в stash, не индексируем и не считаем правками."""
+        out = Path(self.cfg["output"]["dir"])
+        if out.is_absolute():
+            return []
+        # уже исключённый через .gitignore путь git не даёт упоминать в pathspec («paths are ignored») — и не нужно
+        try:
+            return [] if gitutil.ignored(self.repo, out.as_posix()) else [out.as_posix()]
+        except Exception:
+            return [out.as_posix()]
+
+    def _prepare_in_place(self, ex: dict) -> None:
+        """Исполнение прямо в репозитории: сначала чистое рабочее дерево, затем своя ветка debate/<имя>.
+
+        Незакоммиченные правки пользователя иначе смешались бы с правками исполнителя: попали бы в дифф для ревьюера
+        и в ту же ветку. Поэтому перед стартом — выбор: спрятать в stash, закоммитить самому или исполнять всё равно.
+        """
+        while True:
+            st = gitutil.dirty(self.repo, self._service_paths())
+            if not st:
+                break
+            lines = st.splitlines()
+            shown = "\n".join(lines[:15]) + (f"\n… и ещё {len(lines) - 15}" if len(lines) > 15 else "")
+            ch = self.ui.choose(
+                "В репозитории есть незакоммиченные изменения",
+                f"```\n{shown}\n```\n\nИсполнитель будет работать прямо в этой папке. Ваши правки смешаются с его "
+                "правками: попадут в дифф для ревьюера и в ветку исполнения.",
+                {"h": "спрятать их (git stash -u), вернуть потом: git stash pop",
+                 "r": "я закоммичу или уберу сам — проверить ещё раз",
+                 "i": "исполнять всё равно",
+                 "s": "остановить (продолжить потом через debate resume)"})
+            if ch == "s":
+                raise Stopped
+            if ch == "i":
+                break
+            if ch == "h":
+                gitutil.stash(self.repo, f"debate: перед исполнением {self.slug}", self._service_paths())
+                ex["stashed"] = True
+                self._t("\n> *Незакоммиченные изменения пользователя спрятаны в git stash.*\n")
+        if not self.cfg["exec"].get("branch", True):
+            return
+        base = gitutil.current_branch(self.repo)
+        branch = f"debate/{self.slug}"
+        created = gitutil.switch_branch(self.repo, branch)
+        ex.update(branch=branch, base_branch=base)
+        self.ui.info(f"{'Создана ветка' if created else 'Переключено на ветку'} {branch}"
+                     + (f" (от {base})" if base and created else "") + ". Исполнитель работает прямо в репозитории.")
+
+    def _in_worktree(self, ex: dict) -> bool:
+        """Исполнение идёт в отдельной папке. Обсуждения старых версий не хранят флаг — судим по рабочему каталогу."""
+        if "worktree" in ex:
+            return bool(ex["worktree"])
+        return bool(ex.get("workdir")) and Path(ex["workdir"]).resolve() != self.repo.resolve()
+
+    def _check_branch(self, ex: dict) -> None:
+        """При продолжении исполнения в репозитории — убедиться, что открыта ветка исполнения."""
+        branch = ex.get("branch")
+        if ex.get("step", "setup") == "setup" or not branch or self._in_worktree(ex) or ex.get("step") == "final":
+            return
+        try:
+            cur = gitutil.current_branch(self.repo)
+        except Exception:
+            return
+        if cur == branch:
+            return
+        ch = self.ui.choose("Открыта другая ветка",
+                            f"Исполнение идёт в ветке `{branch}`, а сейчас открыта `{cur or 'HEAD (detached)'}`.",
+                            {"w": f"переключиться на {branch}", "s": "остановить"})
+        if ch == "s":
+            raise Stopped
+        if gitutil.dirty(self.repo, self._service_paths()):
+            self.ui.info("Есть незакоммиченные изменения — git может отказаться переключать ветку.")
+        gitutil.switch_branch(self.repo, branch)
+
+    def _finish_hint(self, ex: dict, wd: Path) -> str:
+        """Что делать пользователю после исполнения: проверить, закоммитить, слить, прибрать."""
+        branch, base = ex.get("branch"), ex.get("base_branch") or "<ваша ветка>"
+        if not branch:
+            return "Изменения в рабочей копии (проиндексированы, не закоммичены): проверьте `git diff --cached` и закоммитьте."
+        steps = []
+        if self._in_worktree(ex):
+            steps += [f"cd {wd}", "git diff --cached", "git commit -m '...'", f"cd {self.repo}",
+                      f"git merge {branch}", f"git worktree remove {wd}", f"git branch -d {branch}"]
+        else:
+            steps += ["git diff --cached", "git commit -m '...'", f"git switch {base}",
+                      f"git merge {branch}", f"git branch -d {branch}"]
+            if ex.get("stashed"):
+                steps.append("git stash pop    # вернуть ваши спрятанные изменения")
+        where = "в worktree" if self._in_worktree(ex) else "в репозитории"
+        return (f"Изменения {where} в ветке `{branch}` (проиндексированы, не закоммичены). "
+                "Проверьте, закоммитьте и слейте:\n\n```\n" + "\n".join(steps) + "\n```")
 
     # ================= ход агента =================
     def _turn(self, role: str, prompt: str, mode: str = "debate", cwd: Path | None = None) -> dict:
@@ -375,11 +563,20 @@ class Engine:
         (повторить / дописать комментарий / остановить), спрашивает разрешения на отклонённые действия
         и повторяет ход с ними, продолжает оборванный ход, один раз просит повторить нечитаемый JSON.
         """
-        agent = self.roles[role]
-        label = f"{P.ROLE_RU[role]} · {agent.name}"
-        full = P.notes_block(self.notes[role]) + prompt
+        if self.roles[role].name in self.f["exhausted"]:
+            nxt = self._next_agent(role)
+            if nxt:
+                self._switch(role, nxt, f"{self.roles[role].name} недоступен в этом обсуждении")
         rules = P.system_rules(role, self.cfg["rules"].get("extra", ""), self.cfg["rules"].get("language", "ru"))
+        extra_notes: list[str] = []
         while True:
+            agent = self.roles[role]
+            label = f"{P.ROLE_RU[role]} · {agent.name}"
+            full = P.notes_block(self.notes[role] + extra_notes) + prompt
+            if role in self.f["takeover"]:
+                ex = self.f.get("exec") or {}
+                full = P.p_takeover(role, self.brief, self.plan, self.version,
+                                    ex.get("workdir") if mode == "exec" or role == "reviewer" else None) + full
             try:
                 with self.ui.working(label):
                     res = agent.ask(full, cwd=cwd or self.repo, rules=rules, mode=mode)
@@ -388,18 +585,41 @@ class Engine:
                 ch = self.ui.choose(f"Ход прерван: {label}", "Агент остановлен.",
                                     {"r": "повторить ход", "n": "добавить комментарий и повторить", "s": "остановить всё"})
             except AgentError as e:
-                ch = self.ui.choose(f"Ошибка: {label}", str(e), {"r": "повторить ход", "s": "остановить всё"})
+                nxt = self._next_agent(role)
+                if nxt and P.is_unavailable(str(e)):
+                    # лимит / нет входа / нет CLI: без вопроса отдаём роль следующему из цепочки
+                    self.f["exhausted"].append(agent.name)
+                    self._switch(role, nxt, str(e)[:300])
+                    continue
+                opts = {"r": "повторить ход"}
+                if nxt:
+                    opts["a"] = f"передать роль запасному агенту: {nxt}"
+                opts["s"] = "остановить всё"
+                ch = self.ui.choose(f"Ошибка: {label}", str(e), opts)
+                if ch == "a":
+                    self._switch(role, nxt, "по выбору пользователя после ошибки")
+                    continue
             if ch == "s":
                 raise Stopped
             if ch == "n":
                 note = self.ui.text("Комментарий для агента")
                 if note:
-                    full = P.notes_block([note]) + full
+                    extra_notes.append(note)
         self.notes[role] = []  # комментарии доставлены
+        if role in self.f["takeover"]:
+            self.f["takeover"].remove(role)  # вводная доставлена, дальше — обычная сессия
         self._count(res)
         data = P.extract_json(res.text)
+        asked: set[str] = set()  # отказы, о которых уже спрашивали в этом ходе
         for _ in range(3):
-            granted = self._ask_grants(agent, label, res.denials, mode) if res.denials else None
+            fresh = [d for d in res.denials if f"{d['tool']}:{d['cmd']}" not in asked]
+            if res.denials and not fresh:
+                # разрешение выдано, а отказ тот же: спрашивать снова бессмысленно — шаблон не подходит этому CLI
+                self.ui.info(f"{label}: после разрешения агент снова получил отказ на те же команды — "
+                             "дальше без них (шаблон можно поправить через «t — ввести свои шаблоны» в следующий раз).")
+                break
+            asked.update(f"{d['tool']}:{d['cmd']}" for d in fresh)
+            granted = self._ask_grants(agent, label, fresh, mode) if fresh else None
             if granted:
                 follow = P.p_after_grant(granted)
             elif res.stop == "cancelled" and data is None:
@@ -459,9 +679,10 @@ class Engine:
         opts: dict[str, str] = {}
         if sugg:
             opts["w"] = "разрешить по шаблону: " + ", ".join(sugg)
-        exact = [d for d in new if d["tool"] == "Bash" and not d.get("truncated")]
-        if exact and len(exact) == len(new):
-            opts["e"] = "разрешить ровно эти команды"
+        exact_ok = all(d["tool"] == "Bash" and not d.get("truncated") for d in new)
+        exact = [x for x in P.exact_patterns(new) if x not in allowed and x not in self.f["grants" if mode != "exec" else "grants_exec"]]
+        if exact_ok and exact:
+            opts["e"] = "разрешить ровно эти команды: " + ", ".join(exact)
         opts.update({"t": "ввести свои шаблоны", "c": "продолжить без них",
                      "x": "продолжить без них и больше не спрашивать в этом обсуждении",
                      "s": "остановить (продолжить потом через debate resume)"})
@@ -477,7 +698,7 @@ class Engine:
         if ch == "w":
             pats = sugg
         elif ch == "e":
-            pats = [f"Bash({d['cmd']})" for d in exact]
+            pats = exact
         else:
             raw = self.ui.text("Шаблоны через запятую или с новой строки, например: Bash(ssh:*), Bash(curl -s:*), WebFetch")
             pats = [x.strip() for x in raw.replace("\n", ",").split(",") if x.strip()]
@@ -590,6 +811,14 @@ class Engine:
 
 
 # ================= старые обсуждения =================
+def _review_unresolved(flow: dict) -> bool:
+    """Обсуждение завершено, но последнее ревью не одобрило изменения — его есть смысл продолжить."""
+    ex = flow.get("exec") or {}
+    return (flow.get("phase") == "done" and ex.get("step") == "final" and bool(ex.get("reviews"))
+            and not ex.get("accepted")
+            and str(ex.get("verdict", "")).lower() not in ("approve", ""))
+
+
 def _upgrade_legacy(d: Path, st: dict) -> dict:
     """state.json версии до resume: восстанавливаем этап по файлам обсуждения."""
     raw = d / "raw"
@@ -641,6 +870,6 @@ def list_debates(repo: Path, out_dir: str) -> list[dict]:
             "slug": d.name, "dir": d, "phase": phase,
             "phase_ru": PHASE_RU.get(phase, phase) + (" (старая версия)" if legacy else ""),
             "round": flow.get("round"), "version": st.get("version"), "updated": st.get("updated", ""),
-            "brief": brief.splitlines()[0] if brief else "", "resumable": phase in PHASE_RU and phase != "done",
+            "brief": brief.splitlines()[0] if brief else "", "resumable": phase in PHASE_RU and (phase != "done" or _review_unresolved(flow)),
         })
     return rows

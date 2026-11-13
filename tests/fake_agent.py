@@ -14,6 +14,11 @@ state = Path(os.environ.get("FAKE_STATE", "/tmp/fake-state"))
 state.mkdir(parents=True, exist_ok=True)
 argv = sys.argv[1:]
 
+if os.environ.get("FAKE_LIMIT") == kind:
+    # имитация исчерпанного лимита подписки
+    print("Error: usage limit reached for your plan, try again later", file=sys.stderr)
+    sys.exit(1)
+
 
 def opt(*names):
     for n in names:
@@ -68,6 +73,10 @@ if stage == "independent_analysis" and n == 1 and os.environ.get("FAKE_CANCEL") 
 elif stage == "propose" and os.environ.get("FAKE_DENY") and kind == "claude":
     denials = [{"tool_name": "Bash", "tool_input": {"command": "ssh -o BatchMode=yes user@10.0.0.1 'docker ps'"}}]
     text = j({"verdict": "proposal", "summary": "План без стенда", "plan": "# План v1\n1. Без стенда"})
+elif stage == "continue_after_grant" and os.environ.get("FAKE_DENY_REPEAT"):
+    # разрешение выдано, но CLI снова отклоняет ту же команду
+    denials = [{"tool_name": "Bash", "tool_input": {"command": "ssh -o BatchMode=yes user@10.0.0.1 'docker ps'"}}]
+    text = j({"verdict": "proposal", "summary": "Всё ещё без стенда", "plan": "# План v1\n1. Без стенда"})
 elif stage == "continue_after_grant":
     ok = any("Bash(ssh:*)" in a for a in argv)
     text = j({"verdict": "proposal", "summary": "После разрешения" if ok else "Разрешения нет",
@@ -98,6 +107,10 @@ elif stage in ("execute", "fix"):
     if exec_mode:
         Path("feature.txt").write_text(f"done {stage}\n")
     text = j({"verdict": "done", "summary": f"Сделано ({stage})", "changed_files": ["feature.txt"], "checks_run": []})
+elif stage == "review" and os.environ.get("FAKE_REVIEW_NEVER"):
+    # ревьюер не одобряет никогда и пишет поля не по схеме (как OpenCode): file/text вместо evidence/claim
+    text = j({"verdict": "changes_requested", "summary": "Всё ещё не то",
+              "points": [{"id": "R1", "severity": "Blocker", "file": "feature.txt:1", "text": "поправка не внесена"}]})
 elif stage == "review":
     if n == 1:
         text = j({"verdict": "changes_requested", "summary": "Нужна правка",
