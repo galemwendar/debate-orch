@@ -5,8 +5,9 @@
 > *English summary:* a console orchestrator that makes two coding-agent CLIs (Claude Code, Grok Build, Qwen Code,
 > OpenCode) argue about an implementation plan until they agree, escalating to you only on deadlock or critical
 > questions, then executes the agreed plan in a git worktree with a cross-review loop. It drives the official CLIs
-> headless, so it runs on your existing subscriptions — no API keys. Agent prompts are in English, agents reply in the
-> language you set (`[rules] language`, Russian by default); the console UI is in Russian for now.
+> headless, so it runs on your existing subscriptions — no API keys. Linux only (use WSL on Windows).
+> Agent prompts are in English; agents write plans and reviews in the language you set (`[rules] language`,
+> Russian by default). The console UI is in Russian for now.
 
 Вы даёте задачу или тикет. Автор (по умолчанию Claude Code) пишет план, критик (по умолчанию Grok Build) его разбирает,
 они спорят сами, по раундам. Вас зовут, только когда:
@@ -20,6 +21,10 @@
 
 Агенты запускаются через свои официальные CLI в неинтерактивном режиме (`claude -p`, `grok -p`, `qwen -p`,
 `opencode run`), то есть **на ваших подписках**, без отдельных API-ключей и без оплаты за токены.
+
+Инструкции агентам написаны по-английски: так модели точнее держат формат ответа, и это дешевле по токенам.
+Планы, замечания и вопросы агенты пишут на вашем языке — его задаёт `[rules] language`, по умолчанию русский.
+Интерфейс консоли — на русском.
 
 ## Содержание
 
@@ -62,7 +67,10 @@
 
 ## Установка
 
-Нужны Python 3.11+ и хотя бы два из поддерживаемых CLI, установленные и авторизованные
+Работает на Linux. На Windows запускайте через [WSL](https://learn.microsoft.com/windows/wsl/install): CLI агентов
+тоже ставятся внутри WSL. Нативный Windows не поддерживается.
+
+Нужны Python 3.11+, git и хотя бы два из поддерживаемых CLI, установленные и авторизованные
 (см. [Агенты и модели](#агенты-и-модели)).
 
 ```bash
@@ -248,6 +256,7 @@ debate models opencode     # список моделей, если CLI это у
 
 ## Ограничения
 
+- Только Linux (на Windows — через WSL).
 - Ходы идут последовательно, агенты не работают параллельно.
 - Worktree строится от последнего коммита: в нём нет незакоммиченных правок и файлов вне git (данных, `.env`, моделей).
   Для таких задач — `--in-place` или абсолютные пути в плане.
